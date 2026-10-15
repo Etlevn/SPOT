@@ -9,7 +9,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from data import load_source_tables, preprocess_master_frame
+from load import load_source_tables
+from preprocess import preprocess_master_frame
 
 
 def main() -> None:

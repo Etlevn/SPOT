@@ -2,7 +2,7 @@
 
 SPOT tracks an artificial-intelligence ETF with a small subset of its disclosed constituents. The decision, the data, the mixed-integer quadratic program, and the quarterly out-of-sample backtest have to line up, and the whole pipeline has to be reproducible.
 
-A first master table is built from the raw Excel extracts by `src/data` and inspected with `test_data.py`. The optimizer, the backtest, and the experiment results do not exist yet. Decisions marked TBD have to be frozen before those stages. Quantitative claims require results from the actual pipeline.
+`src` builds the master table from the raw Excel extracts. `check.py` audits that table. `main.py` solves the baseline MIQP for the quarters and windows selected in `config.py`. The out-of-sample backtest and the selection-ratio experiments are not built. A `time_limit` status is a feasible incumbent, not a proven optimum.
 
 ## Question
 
@@ -57,13 +57,13 @@ If \(K=0\), full investment is infeasible. That run is flagged, excluded, and ex
 
 A holdings as-of date is not the date the snapshot became public. A quarter-end file published after quarter-end cannot be used for a rebalance at the start of that quarter. Six timestamps stay distinct: holdings date, publication time, information cutoff, decision time, assumed execution time, and the out-of-sample holding interval. A quarter with no verifiable pre-cutoff snapshot is flagged. A later snapshot is not substituted.
 
-At each decision date the 3-, 6-, and 12-month estimation windows share one eligible universe. Eligibility requires at least twelve months of acceptable prior returns, so differences across windows come from sample length. The optimizer approximates training-period returns with constant weights. The backtest buys and holds from formation, and weights drift with prices. Position bounds apply at formation only. If a holding is delisted or acquired during the quarter, its final realizable return is included and the proceeds stay in cash until the next rebalance.
+At each decision date the 3-, 6-, and 12-month estimation windows share one eligible universe. Eligibility requires at least twelve months of acceptable prior returns, so differences across windows come from sample length. The optimizer approximates training-period returns with constant weights. The planned backtest buys and holds from formation, and weights drift with prices. Position bounds apply at formation only. If a holding is delisted or acquired during the quarter, its final realizable return is included and the proceeds stay in cash until the next rebalance. That cash rule is not in the master table or the solver.
 
-Validate one quarter end to end before scaling to all twelve. That pass tests the pipeline. If earlier out-of-sample quarters are used to choose parameters, later quarters are reserved as the final holdout.
+`main.py` solves every selected quarter and window in calendar order. The backtest that would hold those weights until the next decision date is not built. If earlier out-of-sample quarters are used to choose parameters, later quarters are reserved as the final holdout.
 
 ## Evaluation and comparisons
 
-Out-of-sample active return \(a_t\) is the portfolio return minus the AIQ return. Report both of the following, because they answer different questions:
+A finished solve stores the training mean squared error, formation HHI, and effective holdings \(1/\mathrm{HHI}\). Out-of-sample active return \(a_t\) is the portfolio return minus the AIQ return. That series is not computed yet. Report both of the following, because they answer different questions:
 
 - **RMSE:** the square root of mean squared active return, which includes the average gap.
 - **Tracking error:** the standard deviation of active return, which measures dispersion only.
@@ -113,24 +113,51 @@ Adding Global X later requires one new fact per file: `publication_at`, the firs
 
 The build stops on a duplicate security-date row, an ISIN that maps to two security ids, a repeated ISIN inside one snapshot, a non-USD row in the master table, or an infinite numeric value.
 
-## Implementation principles
+## Run
 
-Raw inputs stay immutable, with provenance, transformations, and quality flags kept alongside them. Acquisition, cleaning, universe construction, optimization, backtesting, evaluation, and experiments stay separate. The optimizer receives validated return matrices and ordered security identifiers. The backtester handles execution, weight drift, and corporate events; it does not rewrite eligibility or realized returns. Every run stores its configuration, input snapshot, software and solver versions, run ID, solver status, MIP gap, and runtime. A feasible solution that is not proven optimal is labeled as such. A methodological change updates the specification and the tests before results are regenerated.
+Use Python 3.14. Gurobi 13 publishes wheels through 3.14 and not for 3.15.
 
-`src/data/` and `test_data.py` are in place. The rest of the target layout is not:
+```text
+python3.14 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python check.py
+.venv/bin/python main.py
+```
+
+`config.py` chooses the solver, the quarters, and the windows. An empty `quarters` tuple runs all twelve decision dates, from 2023Q4 through 2026Q3. `window_months` accepts only the prepared lengths 3, 6, and 12, and a single length is written `(3,)`. The two filters combine. No match raises `ValueError`.
+
+`check.py` writes the audit tables under `output/check/`. `main.py` does not read that directory. It reloads the Excel extracts, builds the return matrices in memory, and solves them.
+
+Each run creates `output/solve/<run_id>/`:
+
+| File | Contents |
+|---|---|
+| `run.json` | Python version, solver and version, windows, \(\alpha\), \(\ell\), \(u\), time limit, and MIP-gap setting |
+| `summary.csv` | Status, training mean squared error, HHI, effective holdings, MIP gap, best bound, and runtime |
+| `checks.csv` | Budget, bounds, cardinality, and objective checks, each cell as `value (passed)` |
+| `weights.csv` | Every eligible name, in solve order, with weight and activation |
+
+Rows are kept in calendar order, older quarters first. Within a quarter the shorter window comes first. `status` of `time_limit` or `iteration_limit` means the search stopped with a feasible incumbent.
+
+## Solvers
+
+`config.solver` is `"gurobi"`, `"scip"`, or `"bonmin"`.
+
+The pip-installed Gurobi license is size-limited to 200 variables. This formulation uses two variables per eligible name plus one error variable per training day, so a 3-month window fits and a 6- or 12-month window is rejected at `optimize`. SCIP and Bonmin can run those longer windows. SCIP reports the MIP gap and best bound on a stopped search. Bonmin reports them when the solve is proven optimal; otherwise those two summary cells stay empty.
+
+Bonmin is the executable at `.tools/bonmin/bin/bonmin`, or the path in `BONMIN_EXECUTABLE`. Pyomo calls it.
 
 ```text
 SPOT/
-├── configs/          # base, data, experiments
-├── data/             # raw, processed, model_inputs
-├── src/              # data, universe, optimization, backtest, evaluation, experiments
-├── scripts/
-├── tests/
-├── results/
-└── reports/
+├── config.py
+├── main.py
+├── check.py
+├── test_data.py
+├── model/miqp.py
+├── src/
+├── requirements.txt
+└── output/
 ```
-
-Reusable logic lives in `src/`, orchestration in `scripts/`, and configuration in `configs/`. Notebooks are for exploration and figures.
 
 ## Decisions still open
 
@@ -141,6 +168,6 @@ Still able to change whether the conclusions are valid:
 1. An information cutoff separate from the SEC filing date, the market timezone, and the execution price.
 2. A check of each SEC-derived filing date against the original EDGAR filing.
 3. Delisting proceeds in the backtest. The master table stops a series at its last price and does not create cash.
-4. Solver tolerances and time limits, and which quarters are held out if earlier tests are used for tuning.
+4. The time limit used for reported solves, and which quarters are held out if earlier tests are used for tuning. The code records the limit it was given.
 
-`DATA_SPEC.md` (schemas, sources, cleaning, return and calendar rules) and `ARCHITECTURE.md` (interfaces, dependencies, commands, and error handling) are still to be written.
+The backtest, the equal-weight and disclosure-weight comparisons, and the selection-ratio grid are not implemented.

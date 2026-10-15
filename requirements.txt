@@ -1,3 +1,7 @@
 pandas
 openpyxl
 tqdm
+gurobipy
+pyscipopt
+pyomo
+packaging

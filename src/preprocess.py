@@ -417,6 +417,6 @@ def _join_unique(values: pd.Series) -> object:
 
 if __name__ == "__main__":
     raise SystemExit(
-        "data.preprocess cannot be executed directly. "
+        "preprocess cannot be executed directly. "
         "Call it from test_data.py or main."
     )

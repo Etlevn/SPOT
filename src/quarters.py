@@ -9,14 +9,14 @@ import math
 
 if __name__ == "__main__":
     raise SystemExit(
-        "data.quarters cannot be executed directly. Call it from check.py or main."
+        "quarters cannot be executed directly. Call it from check.py or main."
     )
 
 import pandas as pd
 from tqdm.auto import tqdm
 
-from data.load import _SHEETS
-from data.preprocess import (
+from load import _SHEETS
+from preprocess import (
     _clean_text,
     _isin_to_security,
     _sec_holdings,

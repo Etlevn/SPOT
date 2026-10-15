@@ -9,7 +9,7 @@ from xml.etree import ElementTree
 import pandas as pd
 from tqdm.auto import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 HOLDINGS_WORKBOOK = "raw_data_AIQ holdings and ETF prices.xlsx"
 YAHOO_WORKBOOK = "raw_data_Yahoo_constituent_prices.xlsx"
@@ -155,5 +155,5 @@ def load_source_tables(data_dir: Path | None = None) -> dict[str, pd.DataFrame]:
 
 if __name__ == "__main__":
     raise SystemExit(
-        "spot.data.load cannot be executed directly. Call it from test_data.py or main."
+        "load cannot be executed directly. Call it from test_data.py or main."
     )
