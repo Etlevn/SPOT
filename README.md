@@ -14,12 +14,12 @@ This is index replication. The objective is to shrink the gap between portfolio 
 
 ## Scope
 
-- **Benchmark:** AIQ, under one USD return definition for the whole study.
-- **Universe:** the latest holdings publicly available before each decision cutoff, after eligibility checks.
+- **Benchmark:** AIQ, quoted in USD. Constituent returns stay in the vendor's USD series; local-currency listings are not converted.
+- **Universe:** the latest holdings whose SEC filing date is on or before the decision date, after the eligibility checks below.
 - **Portfolio:** long only; nonnegative weights that sum to one at formation; rebalanced quarterly; buy-and-hold between rebalances, with no daily reset to target weights.
 - **Solver:** Gurobi, as a mixed-integer quadratic program (MIQP).
 - **Left out of the base model:** shorting, leverage, derivatives, taxes, explicit transaction costs, and turnover penalties.
-- **Tentative window:** prices from about October 2022 through September 2026; twelve out-of-sample quarters from October 2023 through September 2026. Exact bounds depend on verified historical holdings and data availability.
+- **Window in the current check:** prices from 2022-09-30 through 2026-09-30, and twelve decision dates, one on the first AIQ trading day of each quarter from 2023-10-01 through 2026-07-01.
 
 ## Model
 
@@ -82,15 +82,14 @@ Experiment grid: baseline \(\alpha=0.10\); selection ratios \(\{0.10,0.20,0.30,0
 
 ## Data
 
-AIQ, THNQ, and ARTY were compared, with ROBT and BOTZ as backups. AIQ has the most complete holdings history and price coverage from October 2022 through September 2026, so it is the first case. The points below describe material downloaded in October 2026. They are not a quarter-by-quarter verification.
+AIQ, THNQ, and ARTY were compared, with ROBT and BOTZ as backups. AIQ has the most complete holdings history and price coverage from October 2022 through September 2026, so it is the first case. The files were downloaded in October 2026. The counts below are what the current loader reads.
 
-- **Holdings:** Global X issuer records cover calendar quarter-ends from about September 2024 through September 2026. SEC-derived records cover about May 2022 through May 2026 and include filing dates. Earlier reporting dates often miss calendar quarter-ends. Each decision uses the latest holdings verifiably public before the cutoff, reconciled to original disclosures and matched to prices by security identifier.
-- **Constituent prices:** 114 price series and 108,860 daily observations are in hand. Fourteen historical ticker symbols are still missing, and nine adjusted closes are missing in the retrieved series. U.S. listings are planned from WRDS/CRSP; overseas listings from Yahoo Finance with the exchange suffix. Securities that stay unavailable are dropped from the eligible set, and their share of disclosed ETF weight is reported.
-- **AIQ prices:** Yahoo Finance, 2022-09-30 through 2026-09-30, with no missing adjusted prices.
+- **Holdings:** the SEC-derived sheet has 1,441 rows and 17 snapshots from 2022-05-31 through 2026-05-31. Every filing date is on or after its as-of date, and every row matches an ISIN on the coverage sheet. Global X issuer quarter-end files are in the workbook and are not read.
+- **Coverage sheet:** 129 symbols, 115 marked available and 14 unavailable. AIQ is the benchmark, not a constituent.
+- **Constituent prices:** the Yahoo sheet has 108,860 rows and 114 tickers from 2022-09-30 through 2026-09-30, quoted in USD and in other currencies. Compustat North America supplies USD prices where the coverage sheet marks a name unavailable. Compustat Global is not read.
+- **AIQ prices:** Yahoo Finance, 1,003 rows from 2022-09-30 through 2026-09-30, currency USD, with no missing adjusted close. The first daily return is missing.
 
-Returns are USD total returns. For a foreign-currency asset, \((1+r^{\mathrm{USD}})=(1+r^{\mathrm{local}})(1+r^{\mathrm{FX}})\), with the FX rate as USD per local currency unit. Tickers change, so the permanent key is a stable security identifier.
-
-The master table does not forward-fill prices. Exchange holidays, halts, and vendor gaps stay distinct, and failures stay explicit.
+The master table has no FX series. A name whose coverage currency is not USD is left out, rather than converted from a local return. Missing prices stay missing; nothing is forward-filled. Tickers change, so `security_id` is the Yahoo or WRDS symbol on the coverage sheet.
 
 ## How the raw extracts become the master table
 
@@ -106,7 +105,7 @@ Adding Global X later requires one new fact per file: `publication_at`, the firs
 
 **One security id comes from the Yahoo coverage sheet.** SEC rows have an ISIN and no trading symbol. Price rows use a Yahoo or WRDS symbol. The coverage sheet is the crosswalk, and `security_id` is that symbol. Several ISINs separated by semicolons belong to one security. If one snapshot lists more than one of those ISINs, their disclosed weights are summed. Values of `N/A` become missing. AIQ itself stays in the benchmark columns and is not a constituent. A missing issuer ticker or exchange is left missing.
 
-**Local-currency listings stay out.** No FX table is used. A security quoted in a currency other than USD is dropped. A name Yahoo no longer prices is kept only when the Compustat North America extract has a USD series, which is how delisted names such as TWTR and SPLK enter. Compustat Global is not read. Toshiba, Aveva, and Mandiant have no USD price here, so they are absent.
+**Local-currency listings stay out.** No FX table is used. A coverage currency other than USD is dropped. A blank coverage currency can still enter when the Compustat North America row is USD. A name Yahoo no longer prices is kept only when that Compustat extract has a USD series, which is how delisted names such as TWTR and SPLK enter. Of the coverage names other than AIQ, 33 are absent from the master table: 29 because the quotation is not USD, three because no USD price was found (`6502.T`, `AVV.L`, `MNDT`), and `SPCX` because it is not in the SEC USD holdings. Compustat Global is not read.
 
 **The two price extracts share one set of columns.** Yahoo rows keep close, adjusted close, and daily return, with `return_basis` equal to `adjusted_close`. WRDS rows use `prccd` as close and `prccd / ajexdi` as adjusted close. When the total-return factor `trfd` is present, the daily return uses it. Abiomed and CyberArk have no factor, so their return is the price change and `quality_flag` says so. The first day of each series has no previous price, so its return stays missing. A series stops on its last available price. No forward fill is applied, and no cash proceeds are invented.
 
@@ -135,14 +134,13 @@ Reusable logic lives in `src/`, orchestration in `scripts/`, and configuration i
 
 ## Decisions still open
 
-Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, \(\alpha=0.10\), \(\ell=0\), \(u=1\), quarterly rebalancing, the 3/6/12-month windows on a shared eligible universe, and the exclusion of transaction costs from the base model.
+Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, \(\alpha=0.10\), \(\ell=0\), \(u=1\), quarterly rebalancing, the 3/6/12-month windows on one eligible universe, and the exclusion of transaction costs from the base model. The current master table also fixes USD-only membership with no FX conversion, SEC filing dates as the publication time, no price forward fill, and eligibility that requires a return on every AIQ trading day in the prior twelve months.
 
 Still able to change whether the conclusions are valid:
 
-1. Quarter boundaries, market timezone, information cutoff, execution prices, and non-trading days.
-2. A quarter-by-quarter audit of when each holdings file was actually published.
-3. Non-U.S. calendars and FX, aligned to one USD return calendar shared with the benchmark.
-4. Missing prices, delistings, dividends, and cash.
-5. Solver tolerances and time limits, and which quarters are held out if earlier tests are used for tuning.
+1. An information cutoff separate from the SEC filing date, the market timezone, and the execution price.
+2. A check of each SEC-derived filing date against the original EDGAR filing.
+3. Delisting proceeds in the backtest. The master table stops a series at its last price and does not create cash.
+4. Solver tolerances and time limits, and which quarters are held out if earlier tests are used for tuning.
 
 `DATA_SPEC.md` (schemas, sources, cleaning, return and calendar rules) and `ARCHITECTURE.md` (interfaces, dependencies, commands, and error handling) are still to be written.

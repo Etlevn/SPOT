@@ -15,6 +15,9 @@ from data import load_source_tables, preprocess_master_frame
 def main() -> None:
     tables = load_source_tables()
     df = preprocess_master_frame(tables)
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", None)
+    pd.set_option("display.max_colwidth", None)
     print(df.shape)
     print(df.head())
     summary = df.describe(include="all").T
