@@ -23,7 +23,7 @@ This is index replication. The objective is to shrink the gap between portfolio 
 
 ## Model
 
-For quarter \(q\), an estimation window, and a selection ratio, solve over the eligible set \(\mathcal I_q\):
+For quarter $q$, an estimation window, and a selection ratio, solve over the eligible set $\mathcal{I}_q$:
 
 $$
 \begin{aligned}
@@ -38,19 +38,19 @@ $$
 
 | Symbol | Meaning | Baseline |
 |---|---|---|
-| \(z_i\in\{0,1\}\) | Whether stock \(i\) is activated and may receive a positive weight | Decision variable |
-| \(w_i\ge 0\) | Formation weight | Decision variable |
-| \(e_t\) | Portfolio return minus AIQ return on a training day | Decision variable |
-| \(N=\|\mathcal I_q\|\) | Number of eligible stocks that quarter | From the data |
-| \(\alpha\) | Maximum selection ratio | 0.10 |
-| \(K=\lfloor\alpha N\rfloor\) | Maximum number of activated stocks | From that quarter's \(N\) |
-| \(\ell,u\) | Lower and upper weight on an activated stock | 0 and 1 |
+| $z_i\in\{0,1\}$ | Whether stock $i$ is activated and may receive a positive weight | Decision variable |
+| $w_i\ge 0$ | Formation weight | Decision variable |
+| $e_t$ | Portfolio return minus AIQ return on a training day | Decision variable |
+| $N=\|\mathcal{I}_q\|$ | Number of eligible stocks that quarter | From the data |
+| $\alpha$ | Maximum selection ratio | 0.10 |
+| $K=\lfloor\alpha N\rfloor$ | Maximum number of activated stocks | From that quarter's $N$ |
+| $\ell,u$ | Lower and upper weight on an activated stock | 0 and 1 |
 
-\(K\) is a maximum, so the portfolio may hold fewer names. The 10% cap counts eligible stocks, not 10% of ETF market value. Because \(\ell=0\), activation does not force a strictly positive weight; actual holdings are counted from positive weights with a documented numerical tolerance. Selection and weights are chosen in one solve: the objective is the tracking error of the portfolio as a whole.
+$K$ is a maximum, so the portfolio may hold fewer names. The 10% cap counts eligible stocks, not 10% of ETF market value. Because $\ell=0$, activation does not force a strictly positive weight; actual holdings are counted from positive weights with a documented numerical tolerance. Selection and weights are chosen in one solve: the objective is the tracking error of the portfolio as a whole.
 
-For a fixed eligible set, estimation window, and position bounds, a larger \(\alpha\) only expands the feasible set, so the globally optimal in-sample mean squared error cannot get worse. Whether out-of-sample tracking improves is an empirical question.
+For a fixed eligible set, estimation window, and position bounds, a larger $\alpha$ only expands the feasible set, so the globally optimal in-sample mean squared error cannot get worse. Whether out-of-sample tracking improves is an empirical question.
 
-If \(K=0\), full investment is infeasible. That run is flagged, excluded, and explained. Position-cap experiments also require \(Ku\ge 1\).
+If $K=0$, full investment is infeasible. That run is flagged, excluded, and explained. Position-cap experiments also require $Ku\ge 1$.
 
 ## Timing and the backtest
 
@@ -62,22 +62,22 @@ At each decision date the 3-, 6-, and 12-month estimation windows share one elig
 
 ## Evaluation and comparisons
 
-A finished solve stores the training mean squared error, formation HHI, and effective holdings \(1/\mathrm{HHI}\). Out-of-sample active return \(a_t\) is the portfolio return minus the AIQ return. That series is not computed yet. Report both of the following, because they answer different questions:
+A finished solve stores the training mean squared error, formation HHI, and effective holdings $1/\mathrm{HHI}$. Out-of-sample active return $a_t$ is the portfolio return minus the AIQ return. That series is not computed yet. Report both of the following, because they answer different questions:
 
 - **RMSE:** the square root of mean squared active return, which includes the average gap.
 - **Tracking error:** the standard deviation of active return, which measures dispersion only.
 
-Also report cumulative-return differences, the number of positive-weight holdings, the largest weight, HHI \(\sum_i w_i^2\), effective holdings \(1/\mathrm{HHI}\), quarterly turnover, overlap across quarters, and the disclosed AIQ weight of excluded securities. Turnover compares pre-rebalance drifted weights with the new target weights.
+Also report cumulative-return differences, the number of positive-weight holdings, the largest weight, HHI $\sum_i w_i^2$, effective holdings $1/\mathrm{HHI}$, quarterly turnover, overlap across quarters, and the disclosed AIQ weight of excluded securities. Turnover compares pre-rebalance drifted weights with the new target weights.
 
 Three portfolios share the point-in-time universe, the execution rule, and the corporate-event treatment:
 
 1. **MIQP:** joint selection and weights.
-2. **Top-\(K\) equal weight:** the \(K\) eligible names with the largest weights in the latest public AIQ holdings, held equally.
-3. **Top-\(K\) disclosure weight** (proposed extension): the same names, with weights proportional to disclosed AIQ weights and scaled to sum to one.
+2. **Top-$K$ equal weight:** the $K$ eligible names with the largest weights in the latest public AIQ holdings, held equally.
+3. **Top-$K$ disclosure weight** (proposed extension): the same names, with weights proportional to disclosed AIQ weights and scaled to sum to one.
 
-The optimized portfolio may hold fewer than \(K\) names. The two baselines hold exactly \(K\) when that is feasible.
+The optimized portfolio may hold fewer than $K$ names. The two baselines hold exactly $K$ when that is feasible.
 
-Experiment grid: baseline \(\alpha=0.10\); selection ratios \(\{0.10,0.20,0.30,0.40,0.50\}\); estimation windows of 3, 6, and 12 months; optional position caps \(u\in\{1.00,0.50,0.25\}\). Whether the headline result uses the 12-month window is still open.
+Experiment grid: baseline $\alpha=0.10$; selection ratios $\{0.10,0.20,0.30,0.40,0.50\}$; estimation windows of 3, 6, and 12 months; optional position caps $u\in\{1.00,0.50,0.25\}$. Whether the headline result uses the 12-month window is still open.
 
 ## Data
 
@@ -131,7 +131,7 @@ Each run creates `output/solve/<run_id>/`:
 
 | File | Contents |
 |---|---|
-| `run.json` | Python version, solver and version, windows, \(\alpha\), \(\ell\), \(u\), time limit, and MIP-gap setting |
+| `run.json` | Python version, solver and version, windows, $\alpha$, $\ell$, $u$, time limit, and MIP-gap setting |
 | `summary.csv` | Status, training mean squared error, HHI, effective holdings, MIP gap, best bound, and runtime |
 | `checks.csv` | Budget, bounds, cardinality, and objective checks, each cell as `value (passed)` |
 | `weights.csv` | Every eligible name, in solve order, with weight and activation |
@@ -160,7 +160,7 @@ SPOT/
 
 ## Decisions still open
 
-Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, \(\alpha=0.10\), \(\ell=0\), \(u=1\), quarterly rebalancing, the 3/6/12-month windows on one eligible universe, and the exclusion of transaction costs from the base model. The current master table also fixes USD-only membership with no FX conversion, SEC filing dates as the publication time, no price forward fill, and eligibility that requires a return on every AIQ trading day in the prior twelve months.
+Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, $\alpha=0.10$, $\ell=0$, $u=1$, quarterly rebalancing, the 3/6/12-month windows on one eligible universe, and the exclusion of transaction costs from the base model. The current master table also fixes USD-only membership with no FX conversion, SEC filing dates as the publication time, no price forward fill, and eligibility that requires a return on every AIQ trading day in the prior twelve months.
 
 Still able to change whether the conclusions are valid:
 
