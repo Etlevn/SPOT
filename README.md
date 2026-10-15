@@ -25,17 +25,16 @@ This is index replication. The objective is to shrink the gap between portfolio 
 
 For quarter \(q\), an estimation window, and a selection ratio, solve over the eligible set \(\mathcal I_q\):
 
-\[
+$$
 \begin{aligned}
-\min_{w,z,e}\quad & \frac{1}{|\mathcal T|}\sum_{t} e_{t}^{2}\\
-\text{s.t.}\quad
-& e_{t}=\sum_{i} r_{it} w_{i}-b_{t},\\
+\min_{w,z,e}\quad & \frac{1}{|\mathcal{T}|}\sum_{t} e_{t}^{2}\\
+\text{s.t.}\quad & e_{t}=\sum_{i} r_{it} w_{i}-b_{t},\\
 & \sum_{i} w_{i}=1,\\
 & \sum_{i} z_{i}\le K,\quad K=\lfloor\alpha N\rfloor,\\
 & \ell z_{i}\le w_{i}\le u z_{i},\\
 & w_{i}\ge 0,\quad z_{i}\in\{0,1\}.
 \end{aligned}
-\]
+$$
 
 | Symbol | Meaning | Baseline |
 |---|---|---|
