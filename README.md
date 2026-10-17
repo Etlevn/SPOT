@@ -81,7 +81,21 @@ Experiment grid: baseline $\alpha=0.10$; selection ratios $\{0.10,0.20,0.30,0.40
 
 ## Data
 
-AIQ, THNQ, and ARTY were compared, with ROBT and BOTZ as backups. AIQ has the most complete holdings history and price coverage from October 2022 through September 2026, so it is the first case. The files were downloaded in October 2026. The counts below are what the current loader reads.
+The raw Excel extracts live under `data/` on the local machine. That directory is gitignored and is not redistributed with this repository. WRDS / Compustat downloads are covered by the WRDS academic terms of use and must not be posted publicly. Yahoo Finance extracts are also kept local. Place the three workbooks below in `data/` before running `check.py` or `main.py`.
+
+| Local file | Source | Sheets the loader reads |
+|---|---|---|
+| `raw_data_AIQ holdings and ETF prices.xlsx` | SEC N-PORT-derived AIQ holdings, Yahoo coverage crosswalk, AIQ prices | `SEC derived holdings`, `Yahoo coverage`, `AIQ prices` |
+| `raw_data_Yahoo_constituent_prices.xlsx` | Yahoo Finance constituent prices | `Yahoo stock prices` |
+| `raw_data_WRDS_supplemental_prices.xlsx` | WRDS Compustat North America daily prices for names Yahoo does not cover | `Compustat NA` |
+
+How to obtain each extract:
+
+1. **Holdings and coverage.** Build the SEC-derived holdings sheet from AIQ N-PORT filings (`asOf`, `filedDate`, ISIN, weight). Keep a Yahoo coverage sheet that maps each ISIN to the trading `security_id` used in the price files. Download AIQ's own Yahoo price series into the same workbook. Global X issuer quarter-end files may sit in the workbook for reference; the loader does not read them.
+2. **Yahoo constituent prices.** For every coverage ticker marked available, download daily close, adjusted close, and return from 2022-09-30 through 2026-09-30 into `Yahoo stock prices`.
+3. **WRDS supplement.** Under an authorized WRDS account, pull Compustat North America daily prices (`tic`, `datadate`, `prccd`, `ajexdi`, `trfd`, and related identifiers) for coverage names Yahoo does not price. Do not commit or publish that extract. Compustat Global is not read.
+
+AIQ, THNQ, and ARTY were compared, with ROBT and BOTZ as backups. AIQ has the most complete holdings history and price coverage from October 2022 through September 2026, so it is the first case. The study extracts were downloaded in October 2026. The counts below are what the current loader reads from a complete local `data/` folder.
 
 - **Holdings:** the SEC-derived sheet has 1,441 rows and 17 snapshots from 2022-05-31 through 2026-05-31. Every filing date is on or after its as-of date, and every row matches an ISIN on the coverage sheet. Global X issuer quarter-end files are in the workbook and are not read.
 - **Coverage sheet:** 129 symbols, 115 marked available and 14 unavailable. AIQ is the benchmark, not a constituent.
@@ -154,6 +168,7 @@ SPOT/
 ├── test_data.py
 ├── model/miqp.py
 ├── src/
+├── data/            # local only; gitignored
 ├── requirements.txt
 └── output/
 ```
