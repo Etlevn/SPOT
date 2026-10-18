@@ -2,7 +2,7 @@
 
 SPOT tracks an artificial-intelligence ETF with a small subset of its disclosed constituents. The decision, the data, the mixed-integer quadratic program, and the quarterly out-of-sample backtest have to line up, and the whole pipeline has to be reproducible.
 
-`src` builds the master table from the raw Excel extracts. `check.py` audits that table. `main.py` solves the baseline MIQP for the quarters and windows selected in `config.py`. The out-of-sample backtest and the selection-ratio experiments are not built. A `time_limit` status is a feasible incumbent, not a proven optimum.
+`src` builds the master table from the raw Excel extracts. `check.py` audits that table. `main.py` solves the MIQP for the quarters, windows, and $\alpha$ selected in `config.py`. `eval.py` runs the out-of-sample buy-and-hold backtest for one finished solve run and writes the tracking, concentration, and stability metrics defined below. A `time_limit` status is a feasible incumbent, not a proven optimum. The selection-ratio grid is still a planned experiment: each $\alpha$ is a separate solve run, then a separate eval.
 
 ## Question
 
@@ -17,8 +17,8 @@ This is index replication. The objective is to shrink the gap between portfolio 
 - **Benchmark:** AIQ, quoted in USD. Constituent returns stay in the vendor's USD series; local-currency listings are not converted.
 - **Universe:** the latest holdings whose SEC filing date is on or before the decision date, after the eligibility checks below.
 - **Portfolio:** long only; nonnegative weights that sum to one at formation; rebalanced quarterly; buy-and-hold between rebalances, with no daily reset to target weights.
-- **Solver:** Gurobi, as a mixed-integer quadratic program (MIQP).
-- **Left out of the base model:** shorting, leverage, derivatives, taxes, explicit transaction costs, and turnover penalties.
+- **Solver:** MIQP via Gurobi when a full license is available; SCIP is the current default in `config.py` for windows that exceed the size-limited Gurobi install.
+- **Left out of the base model:** shorting, leverage, derivatives, taxes, explicit transaction costs, and turnover penalties. Stability metrics report turnover; they do not enter the objective.
 - **Window in the current check:** prices from 2022-09-30 through 2026-09-30, and twelve decision dates, one on the first AIQ trading day of each quarter from 2023-10-01 through 2026-07-01.
 
 ## Model
@@ -36,15 +36,15 @@ $$
 \end{aligned}
 $$
 
-| Symbol | Meaning | Baseline |
-|---|---|---|
-| $z_i\in\{0,1\}$ | Whether stock $i$ is activated and may receive a positive weight | Decision variable |
-| $w_i\ge 0$ | Formation weight | Decision variable |
-| $e_t$ | Portfolio return minus AIQ return on a training day | Decision variable |
-| $N=\|\mathcal{I}_q\|$ | Number of eligible stocks that quarter | From the data |
-| $\alpha$ | Maximum selection ratio | 0.10 |
-| $K=\lfloor\alpha N\rfloor$ | Maximum number of activated stocks | From that quarter's $N$ |
-| $\ell,u$ | Lower and upper weight on an activated stock | 0 and 1 |
+| Symbol                     | Meaning                                                          | Baseline                |
+| -------------------------- | ---------------------------------------------------------------- | ----------------------- |
+| $z_i\in\{0,1\}$            | Whether stock $i$ is activated and may receive a positive weight | Decision variable       |
+| $w_i\ge 0$                 | Formation weight                                                 | Decision variable       |
+| $e_t$                      | Portfolio return minus AIQ return on a training day              | Decision variable       |
+| $N=\|\mathcal{I}_q\|$      | Number of eligible stocks that quarter                           | From the data           |
+| $\alpha$                   | Maximum selection ratio                                          | 0.10                    |
+| $K=\lfloor\alpha N\rfloor$ | Maximum number of activated stocks                               | From that quarter's $N$ |
+| $\ell,u$                   | Lower and upper weight on an activated stock                     | 0 and 1                 |
 
 $K$ is a maximum, so the portfolio may hold fewer names. The 10% cap counts eligible stocks, not 10% of ETF market value. Because $\ell=0$, activation does not force a strictly positive weight; actual holdings are counted from positive weights with a documented numerical tolerance. Selection and weights are chosen in one solve: the objective is the tracking error of the portfolio as a whole.
 
@@ -56,38 +56,87 @@ If $K=0$, full investment is infeasible. That run is flagged, excluded, and expl
 
 A holdings as-of date is not the date the snapshot became public. A quarter-end file published after quarter-end cannot be used for a rebalance at the start of that quarter. Six timestamps stay distinct: holdings date, publication time, information cutoff, decision time, assumed execution time, and the out-of-sample holding interval. A quarter with no verifiable pre-cutoff snapshot is flagged. A later snapshot is not substituted.
 
-At each decision date the 3-, 6-, and 12-month estimation windows share one eligible universe. Eligibility requires at least twelve months of acceptable prior returns, so differences across windows come from sample length. The optimizer approximates training-period returns with constant weights. The planned backtest buys and holds from formation, and weights drift with prices. Position bounds apply at formation only. If a holding is delisted or acquired during the quarter, its final realizable return is included and the proceeds stay in cash until the next rebalance. That cash rule is not in the master table or the solver.
+At each decision date the 3-, 6-, and 12-month estimation windows share one eligible universe. Eligibility requires at least twelve months of acceptable prior returns, so differences across windows come from sample length. The optimizer approximates training-period returns with constant weights. Position bounds apply at formation only.
 
-`main.py` solves every selected quarter and window in calendar order. The backtest that would hold those weights until the next decision date is not built. If earlier out-of-sample quarters are used to choose parameters, later quarters are reserved as the final holdout.
+`main.py` solves every selected quarter and window in calendar order and writes one `output/solve/<run_id>/` folder. `eval.py` reads that folder's `weights.csv` and simulates the next-quarter hold. The method is:
+
+1. **Formation dates.** Every prepared decision quarter can form a portfolio. By default the final decision date is not used as a formation date; it only closes the previous holding period (`EXCLUDE_FINAL_QUARTER` in `eval.py`). That drops the incomplete last quarter (for example 2026Q3 when no later decision date exists).
+2. **Information and execution.** Target weights are treated as known before the decision-date open. The holding interval is the half-open window $[\text{decision}_q,\text{decision}_{q+1})$.
+3. **Buy-and-hold.** Formation weights are not reset daily. Position values grow with daily returns; missing stock returns on a day are treated as zero for that name. Portfolio return is the value-weighted return of the current levels. Weights drift until the next decision date.
+4. **Active return.** $a_t=r_{p,t}-b_t$, with $b_t$ equal to AIQ's daily return on the same calendar.
+5. **Delisting cash.** The intended rule is to realize a final return and hold proceeds as cash until the next rebalance. The current master table and backtest do not yet create that cash sleeve; a series simply stops at its last available price.
+
+If earlier out-of-sample quarters are used to choose parameters, later quarters are reserved as a final holdout. The code records the solve `time_limit` it was given; a stopped search is reported as an incumbent, not as a proven optimum.
 
 ## Evaluation and comparisons
 
-A finished solve stores the training mean squared error, formation HHI, and effective holdings $1/\mathrm{HHI}$. Out-of-sample active return $a_t$ is the portfolio return minus the AIQ return. That series is not computed yet. Report both of the following, because they answer different questions:
+Evaluation answers three different questions with separate metrics. Tracking quality is primary; concentration and stability are reported alongside it. Cumulative wealth gaps are kept as a secondary path summary, not as the definition of tracking success.
 
-- **RMSE:** the square root of mean squared active return, which includes the average gap.
-- **Tracking error:** the standard deviation of active return, which measures dispersion only.
+### Tracking metrics
 
-Also report cumulative-return differences, the number of positive-weight holdings, the largest weight, HHI $\sum_i w_i^2$, effective holdings $1/\mathrm{HHI}$, quarterly turnover, overlap across quarters, and the disclosed AIQ weight of excluded securities. Turnover compares pre-rebalance drifted weights with the new target weights.
+Let $a_t$ be the out-of-sample active daily return defined above.
 
-Three portfolios share the point-in-time universe, the execution rule, and the corporate-event treatment:
+- **RMSE:** $\sqrt{\frac{1}{T}\sum_t a_t^2}$. Includes bias from a nonzero mean active return.
+- **Tracking error (TE):** sample standard deviation of $a_t$. Dispersion only.
+- **Return correlation:** Pearson correlation between the portfolio daily-return series and the AIQ daily-return series over the same dates.
+- **Cumulative active return:** difference between the cumulative portfolio gross return and the cumulative AIQ gross return over the evaluated path.
 
-1. **MIQP:** joint selection and weights.
-2. **Top-$K$ equal weight:** the $K$ eligible names with the largest weights in the latest public AIQ holdings, held equally.
-3. **Top-$K$ disclosure weight** (proposed extension): the same names, with weights proportional to disclosed AIQ weights and scaled to sum to one.
+RMSE is the headline tracking score. Correlation summarizes co-movement of daily returns. TE is retained because it answers a different question from RMSE. Path plots label strategies with RMSE and correlation.
 
-The optimized portfolio may hold fewer than $K$ names. The two baselines hold exactly $K$ when that is feasible.
+### Concentration metrics
 
-Experiment grid: baseline $\alpha=0.10$; selection ratios $\{0.10,0.20,0.30,0.40,0.50\}$; estimation windows of 3, 6, and 12 months; optional position caps $u\in\{1.00,0.50,0.25\}$. Whether the headline result uses the 12-month window is still open.
+Reported at each formation from the target weights:
+
+- number of strictly positive weights;
+- largest weight;
+- HHI $\sum_i w_i^2$;
+- effective holdings $1/\mathrm{HHI}$.
+
+A finished solve also stores the in-sample training mean squared error and the same concentration measures on the optimized weights.
+
+### Stability metrics
+
+Between consecutive formation quarters, for each strategy and estimation window:
+
+- **Turnover:** $\frac12\sum_i|\widetilde w_{q,i}-w_{q+1,i}|$, where $\widetilde w_q$ is the drifted weight vector at the end of quarter $q$'s holding period and $w_{q+1}$ is the next formation target. Missing names are treated as weight zero.
+- **Holding overlap:** Jaccard overlap of the positive-weight sets of the two consecutive formation targets, $|S_q\cap S_{q+1}|/|S_q\cup S_{q+1}|$.
+
+The first formation quarter has no predecessor, so both fields are empty there. Window-level summaries use the mean over the quarters that have a value.
+
+### Excluded disclosed weight
+
+Separately from the backtest path, each decision quarter records how much of the latest public AIQ holdings snapshot is left out of the eligible set: counts and disclosed weight percentages by reason (`non_usd`, `unmapped`, `no_price`, `short_history`), plus totals. Those figures describe universe coverage; they are not portfolio performance.
+
+### Comparison portfolios
+
+Every strategy uses the same point-in-time eligible universe, the same decision calendar, and the same buy-and-hold rule. For a solve run with selection ratio $\alpha$, $K=\lfloor\alpha N\rfloor$ on that quarter's eligible set:
+
+1. **MIQP:** joint selection and weights from `weights.csv` for each estimation window present in the run.
+2. **ew:** equal weight on every eligible name that quarter (full-universe equal weight; not limited to $K$).
+3. **topk:** the $K$ eligible names with the largest disclosed AIQ weights in the latest public snapshot, held with equal weight $1/K$.
+
+The optimized portfolio may hold fewer than $K$ names. The Top-$K$ baseline holds exactly $K$ when that is feasible. A disclosure-weighted Top-$K$ variant (same names, weights proportional to disclosed AIQ weights) is a planned extension and is not in `eval.py`.
+
+### Experiment grid (method)
+
+| Dimension                   | Method                                                                                                                             |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Baseline $\alpha$           | One solve and one eval at $\alpha=0.10$                                                                                            |
+| Selection-ratio sensitivity | Separate solve runs for $\alpha\in\{0.10,0.20,0.30,0.40,0.50\}$, each followed by its own eval; compare window metrics across runs |
+| Estimation window           | Same eligible universe; $L\in\{3,6,12\}$ months inside each solve when selected in `config.py`                                     |
+| Optional position caps      | $u\in\{1.00,0.50,0.25\}$ with $Ku\ge 1$; not required for the baseline path                                                        |
+
+`eval.py` always evaluates one solve directory. Cross-$\alpha$ comparison is a later aggregation over those eval folders, not a single mixed-$\alpha$ backtest.
 
 ## Data
 
 The raw Excel extracts live under `data/` on the local machine. That directory is gitignored and is not redistributed with this repository. WRDS / Compustat downloads are covered by the WRDS academic terms of use and must not be posted publicly. Yahoo Finance extracts are also kept local. Place the three workbooks below in `data/` before running `check.py` or `main.py`.
 
-| Local file | Source | Sheets the loader reads |
-|---|---|---|
-| `raw_data_AIQ holdings and ETF prices.xlsx` | SEC N-PORT-derived AIQ holdings, Yahoo coverage crosswalk, AIQ prices | `SEC derived holdings`, `Yahoo coverage`, `AIQ prices` |
-| `raw_data_Yahoo_constituent_prices.xlsx` | Yahoo Finance constituent prices | `Yahoo stock prices` |
-| `raw_data_WRDS_supplemental_prices.xlsx` | WRDS Compustat North America daily prices for names Yahoo does not cover | `Compustat NA` |
+| Local file                                  | Source                                                                   | Sheets the loader reads                                |
+| ------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------ |
+| `raw_data_AIQ holdings and ETF prices.xlsx` | SEC N-PORT-derived AIQ holdings, Yahoo coverage crosswalk, AIQ prices    | `SEC derived holdings`, `Yahoo coverage`, `AIQ prices` |
+| `raw_data_Yahoo_constituent_prices.xlsx`    | Yahoo Finance constituent prices                                         | `Yahoo stock prices`                                   |
+| `raw_data_WRDS_supplemental_prices.xlsx`    | WRDS Compustat North America daily prices for names Yahoo does not cover | `Compustat NA`                                         |
 
 How to obtain each extract:
 
@@ -135,22 +184,35 @@ python3.14 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python check.py
 .venv/bin/python main.py
+.venv/bin/python eval.py
 ```
 
-`config.py` chooses the solver, the quarters, and the windows. An empty `quarters` tuple runs all twelve decision dates, from 2023Q4 through 2026Q3. `window_months` accepts only the prepared lengths 3, 6, and 12, and a single length is written `(3,)`. The two filters combine. No match raises `ValueError`.
+`config.py` chooses the solver, the quarters, the windows, $\alpha$, and the solve time limit. An empty `quarters` tuple runs all twelve decision dates, from 2023Q4 through 2026Q3. `window_months` accepts only the prepared lengths 3, 6, and 12, and a single length is written `(3,)`. The two filters combine. No match raises `ValueError`.
 
 `check.py` writes the audit tables under `output/check/`. `main.py` does not read that directory. It reloads the Excel extracts, builds the return matrices in memory, and solves them.
 
-Each run creates `output/solve/<run_id>/`:
+Each solve creates `output/solve/<run_id>/`:
 
-| File | Contents |
-|---|---|
-| `run.json` | Python version, solver and version, windows, $\alpha$, $\ell$, $u$, time limit, and MIP-gap setting |
-| `summary.csv` | Status, training mean squared error, HHI, effective holdings, MIP gap, best bound, and runtime |
-| `checks.csv` | Budget, bounds, cardinality, and objective checks, each cell as `value (passed)` |
-| `weights.csv` | Every eligible name, in solve order, with weight and activation |
+| File          | Contents                                                                                            |
+| ------------- | --------------------------------------------------------------------------------------------------- |
+| `run.json`    | Python version, solver and version, windows, $\alpha$, $\ell$, $u$, time limit, and MIP-gap setting |
+| `summary.csv` | Status, training mean squared error, HHI, effective holdings, MIP gap, best bound, and runtime      |
+| `checks.csv`  | Budget, bounds, cardinality, and objective checks, each cell as `value (passed)`                    |
+| `weights.csv` | Every eligible name, in solve order, with weight and activation                                     |
 
 Rows are kept in calendar order, older quarters first. Within a quarter the shorter window comes first. `status` of `time_limit` or `iteration_limit` means the search stopped with a feasible incumbent.
+
+`eval.py` is configured at the top of the file: `SOLVE_RUN` selects `output/solve/<run_id>/` (empty string means the latest run with `weights.csv`). It writes `output/eval/<run_id>/`:
+
+| File                    | Contents                                                                       |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| `eval.json`             | Solve path, $\alpha$, windows, formation quarters, and the execution rule used |
+| `daily_returns.csv`     | Daily portfolio, benchmark, and active returns by strategy and window          |
+| `quarterly_metrics.csv` | Per-quarter tracking, concentration, turnover, and holding overlap             |
+| `window_metrics.csv`    | Path-level aggregates used for the printed summary and figure labels           |
+| `baseline_weights.csv`  | Formation weights for `ew` and `topk`                                          |
+| `excluded_weights.csv`  | Eligible-universe exclusions and disclosed AIQ weight by reason                |
+| `paths.png`             | Cumulative-return paths for AIQ and each evaluated strategy                    |
 
 ## Solvers
 
@@ -164,6 +226,7 @@ Bonmin is the executable at `.tools/bonmin/bin/bonmin`, or the path in `BONMIN_E
 SPOT/
 ├── config.py
 ├── main.py
+├── eval.py
 ├── check.py
 ├── test_data.py
 ├── model/miqp.py
@@ -171,17 +234,21 @@ SPOT/
 ├── data/            # local only; gitignored
 ├── requirements.txt
 └── output/
+    ├── check/
+    ├── solve/<run_id>/
+    └── eval/<run_id>/
 ```
 
 ## Decisions still open
 
-Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, $\alpha=0.10$, $\ell=0$, $u=1$, quarterly rebalancing, the 3/6/12-month windows on one eligible universe, and the exclusion of transaction costs from the base model. The current master table also fixes USD-only membership with no FX conversion, SEC filing dates as the publication time, no price forward fill, and eligibility that requires a return on every AIQ trading day in the prior twelve months.
+Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, baseline $\alpha=0.10$, $\ell=0$, $u=1$, quarterly rebalancing, the 3/6/12-month windows on one eligible universe, exclusion of transaction costs from the base model, the out-of-sample buy-and-hold rule in `eval.py`, and the information-matched `ew` and `topk` baselines. The master table also fixes USD-only membership with no FX conversion, SEC filing dates as the publication time, no price forward fill, and eligibility that requires a return on every AIQ trading day in the prior twelve months.
 
 Still able to change whether the conclusions are valid:
 
 1. An information cutoff separate from the SEC filing date, the market timezone, and the execution price.
 2. A check of each SEC-derived filing date against the original EDGAR filing.
 3. Delisting proceeds in the backtest. The master table stops a series at its last price and does not create cash.
-4. The time limit used for reported solves, and which quarters are held out if earlier tests are used for tuning. The code records the limit it was given.
+4. The solve time limit used for reported runs, and which quarters are held out if earlier tests are used for tuning.
+5. How the $\alpha$ grid is orchestrated (manual repeated solves versus a batch driver) and which estimation window is treated as the headline comparison.
 
-The backtest, the equal-weight and disclosure-weight comparisons, and the selection-ratio grid are not implemented.
+Not implemented yet: the disclosure-weighted Top-$K$ baseline, automated multi-$\alpha$ batch solves, and optional position-cap experiments.

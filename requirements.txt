@@ -1,6 +1,7 @@
 pandas
 openpyxl
 tqdm
+matplotlib
 gurobipy
 pyscipopt
 pyomo
