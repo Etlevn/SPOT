@@ -40,7 +40,7 @@ QUARTER_STARTS = pd.to_datetime(
         "2026-07-01",
     ]
 )
-WINDOWS_MONTHS = (3, 6, 12)
+WINDOWS_MONTHS = (3, 6, 9, 12)
 BASELINE_ALPHA = 0.10
 
 
@@ -178,6 +178,7 @@ def _parameter_row(
         "kq_at_least_one": math.floor(BASELINE_ALPHA * len(eligible)) >= 1,
         "T_3": len(_window(calendar, decision, 3)),
         "T_6": len(_window(calendar, decision, 6)),
+        "T_9": len(_window(calendar, decision, 9)),
         "T_12": len(_window(calendar, decision, 12)),
     }
     excluded = snapshot.loc[snapshot["reason"].ne("eligible")]

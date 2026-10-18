@@ -67,12 +67,18 @@ def solve_miqp(
     feasibility_tolerance: float,
     time_limit_seconds: float | None,
     mip_gap: float | None,
+    gap_stall_seconds: float | None,
+    gap_stall_min_drop: float,
     solver_log: bool,
     solver: str,
 ) -> Solution:
     """Minimize mean squared tracking error for one eligible universe."""
     if not 0 <= ell <= u <= 1:
         raise ValueError(f"Position bounds must satisfy 0 <= ell <= u <= 1, got ell={ell}, u={u}.")
+    if gap_stall_seconds is not None and gap_stall_seconds <= 0:
+        raise ValueError(f"gap_stall_seconds must be positive when set, got {gap_stall_seconds}.")
+    if not 0 <= gap_stall_min_drop < 1:
+        raise ValueError(f"gap_stall_min_drop must satisfy 0 <= value < 1, got {gap_stall_min_drop}.")
 
     returns = panel["R"]
     benchmark = panel["b"]
@@ -94,6 +100,8 @@ def solve_miqp(
             u=u,
             time_limit_seconds=time_limit_seconds,
             mip_gap=mip_gap,
+            gap_stall_seconds=gap_stall_seconds,
+            gap_stall_min_drop=gap_stall_min_drop,
             solver_log=solver_log,
             model_name=f"spot_{panel['quarter']}_L{panel['months']}",
         )
@@ -108,6 +116,8 @@ def solve_miqp(
             u=u,
             time_limit_seconds=time_limit_seconds,
             mip_gap=mip_gap,
+            gap_stall_seconds=gap_stall_seconds,
+            gap_stall_min_drop=gap_stall_min_drop,
             solver_log=solver_log,
         )
     elif solver == "bonmin":
@@ -170,6 +180,8 @@ def _solve_gurobi(
     u: float,
     time_limit_seconds: float | None,
     mip_gap: float | None,
+    gap_stall_seconds: float | None,
+    gap_stall_min_drop: float,
     solver_log: bool,
     model_name: str,
 ) -> dict[str, object]:
@@ -207,9 +219,17 @@ def _solve_gurobi(
     for name_index in range(universe_size):
         model.addConstr(weight[name_index] >= ell * activated[name_index], name=f"lower_{name_index}")
         model.addConstr(weight[name_index] <= u * activated[name_index], name=f"upper_{name_index}")
-    model.optimize()
+    if gap_stall_seconds is not None:
+        model._gap_stall_seconds = float(gap_stall_seconds)
+        model._gap_stall_min_drop = float(gap_stall_min_drop)
+        model._gap_stall_ref_gap = None
+        model._gap_stall_ref_time = None
+        model._gap_stall_triggered = False
+        model.optimize(callback=_gurobi_gap_stall_callback)
+    else:
+        model.optimize()
 
-    status = _status_name(model.Status)
+    status = "gap_stall" if getattr(model, "_gap_stall_triggered", False) else _status_name(model.Status)
     weights = pd.Series(0.0, index=securities, name="weight")
     activation = pd.Series(0.0, index=securities, name="activated")
     objective = None
@@ -250,16 +270,19 @@ def _solve_scip(
     u: float,
     time_limit_seconds: float | None,
     mip_gap: float | None,
+    gap_stall_seconds: float | None,
+    gap_stall_min_drop: float,
     solver_log: bool,
 ) -> dict[str, object]:
     try:
-        from pyscipopt import Model, quicksum
+        from pyscipopt import Eventhdlr, Model, SCIP_EVENTTYPE, quicksum
         from pyscipopt.recipes.nonlinear import set_nonlinear_objective
     except ImportError as error:
         raise RuntimeError("pyscipopt is not installed.") from error
 
     universe_size = len(securities)
     model = Model("spot_scip")
+    # Default SCIP output goes to the terminal. Only mute it in summary mode.
     if not solver_log:
         model.hideOutput()
     weight = [model.addVar(lb=0.0, ub=u, name=f"w{name_index}") for name_index in range(universe_size)]
@@ -282,6 +305,51 @@ def _solve_scip(
         model.setParam("limits/time", time_limit_seconds)
     if mip_gap is not None:
         model.setParam("limits/gap", mip_gap)
+    stall_handler = None
+    if gap_stall_seconds is not None:
+
+        class GapStallHandler(Eventhdlr):
+            def __init__(self) -> None:
+                super().__init__()
+                self.stall_seconds = float(gap_stall_seconds)
+                self.min_drop = float(gap_stall_min_drop)
+                self.ref_gap: float | None = None
+                self.ref_time: float | None = None
+                self.last_check_time = -1.0
+                self.triggered = False
+
+            def eventinit(self) -> None:
+                self.model.catchEvent(SCIP_EVENTTYPE.GAPUPDATED, self)
+                self.model.catchEvent(SCIP_EVENTTYPE.NODESOLVED, self)
+
+            def eventexec(self, event) -> None:
+                if self.triggered:
+                    return
+                try:
+                    gap = float(self.model.getGap())
+                    now = float(self.model.getSolvingTime())
+                except (TypeError, ValueError, AttributeError):
+                    return
+                if not math.isfinite(gap) or gap < 0:
+                    return
+                if now - self.last_check_time < 0.5 and self.ref_gap is not None:
+                    return
+                self.last_check_time = now
+                if self.ref_gap is None or self.ref_time is None:
+                    self.ref_gap = gap
+                    self.ref_time = now
+                    return
+                relative_drop = (self.ref_gap - gap) / self.ref_gap if self.ref_gap > 1e-12 else 0.0
+                if relative_drop >= self.min_drop:
+                    self.ref_gap = gap
+                    self.ref_time = now
+                    return
+                if now - self.ref_time >= self.stall_seconds:
+                    self.triggered = True
+                    self.model.interruptSolve()
+
+        stall_handler = GapStallHandler()
+        model.includeEventhdlr(stall_handler, "gap_stall", "Stop when relative gap stalls.")
     model.optimize()
 
     weights = pd.Series(0.0, index=securities, name="weight")
@@ -308,8 +376,11 @@ def _solve_scip(
         "gaplimit": "gap_limit",
         "userinterrupt": "interrupted",
     }
+    status = status_names.get(model.getStatus(), model.getStatus())
+    if stall_handler is not None and stall_handler.triggered:
+        status = "gap_stall"
     return {
-        "status": status_names.get(model.getStatus(), model.getStatus()),
+        "status": status,
         "objective": objective,
         "runtime_seconds": float(model.getSolvingTime()),
         "weights": weights,
@@ -320,6 +391,40 @@ def _solve_scip(
         "solver_version": _scip_version(model),
         "has_solution": has_solution,
     }
+
+
+def _gurobi_gap_stall_callback(model, where) -> None:
+    if gp is None or GRB is None:
+        return
+    if where != GRB.Callback.MIP:
+        return
+    if getattr(model, "_gap_stall_triggered", False):
+        return
+    try:
+        runtime = float(model.cbGet(GRB.Callback.RUNTIME))
+        primal = float(model.cbGet(GRB.Callback.MIP_OBJBST))
+        dual = float(model.cbGet(GRB.Callback.MIP_OBJBND))
+    except (TypeError, ValueError, AttributeError):
+        return
+    if not math.isfinite(primal) or not math.isfinite(dual) or abs(primal) <= 1e-12:
+        return
+    gap = abs(primal - dual) / abs(primal)
+    if not math.isfinite(gap):
+        return
+    ref_gap = getattr(model, "_gap_stall_ref_gap", None)
+    ref_time = getattr(model, "_gap_stall_ref_time", None)
+    if ref_gap is None or ref_time is None:
+        model._gap_stall_ref_gap = gap
+        model._gap_stall_ref_time = runtime
+        return
+    relative_drop = (ref_gap - gap) / ref_gap if ref_gap > 1e-12 else 0.0
+    if relative_drop >= float(model._gap_stall_min_drop):
+        model._gap_stall_ref_gap = gap
+        model._gap_stall_ref_time = runtime
+        return
+    if runtime - ref_time >= float(model._gap_stall_seconds):
+        model._gap_stall_triggered = True
+        model.terminate()
 
 
 def _solve_bonmin(

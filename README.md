@@ -2,7 +2,7 @@
 
 SPOT tracks an artificial-intelligence ETF with a small subset of its disclosed constituents. The decision, the data, the mixed-integer quadratic program, and the quarterly out-of-sample backtest have to line up, and the whole pipeline has to be reproducible.
 
-`src` builds the master table from the raw Excel extracts. `check.py` audits that table. `main.py` solves the MIQP for the quarters, windows, and $\alpha$ selected in `config.py`. `eval.py` runs the out-of-sample buy-and-hold backtest for one finished solve run and writes the tracking, concentration, and stability metrics defined below. A `time_limit` status is a feasible incumbent, not a proven optimum. The selection-ratio grid is still a planned experiment: each $\alpha$ is a separate solve run, then a separate eval.
+`src` builds the master table from the raw Excel extracts. `check.py` audits that table. `main.py` solves the MIQP for the quarters, windows, and selection ratios selected in `config.py`, writing one solve folder whose tables carry an `alpha` column. `eval.py` backtests one finished solve run for the alphas chosen in `EVAL_ALPHAS` and writes the tracking, concentration, and stability metrics defined below. A `time_limit` status is a feasible incumbent, not a proven optimum.
 
 ## Question
 
@@ -56,7 +56,7 @@ If $K=0$, full investment is infeasible. That run is flagged, excluded, and expl
 
 A holdings as-of date is not the date the snapshot became public. A quarter-end file published after quarter-end cannot be used for a rebalance at the start of that quarter. Six timestamps stay distinct: holdings date, publication time, information cutoff, decision time, assumed execution time, and the out-of-sample holding interval. A quarter with no verifiable pre-cutoff snapshot is flagged. A later snapshot is not substituted.
 
-At each decision date the 3-, 6-, and 12-month estimation windows share one eligible universe. Eligibility requires at least twelve months of acceptable prior returns, so differences across windows come from sample length. The optimizer approximates training-period returns with constant weights. Position bounds apply at formation only.
+At each decision date the 3-, 6-, 9-, and 12-month estimation windows share one eligible universe. Eligibility requires at least twelve months of acceptable prior returns, so differences across windows come from sample length. The optimizer approximates training-period returns with constant weights. Position bounds apply at formation only.
 
 `main.py` solves every selected quarter and window in calendar order and writes one `output/solve/<run_id>/` folder. `eval.py` reads that folder's `weights.csv` and simulates the next-quarter hold. The method is:
 
@@ -113,20 +113,21 @@ Every strategy uses the same point-in-time eligible universe, the same decision 
 
 1. **MIQP:** joint selection and weights from `weights.csv` for each estimation window present in the run.
 2. **ew:** equal weight on every eligible name that quarter (full-universe equal weight; not limited to $K$).
-3. **topk:** the $K$ eligible names with the largest disclosed AIQ weights in the latest public snapshot, held with equal weight $1/K$.
+3. **topk_ew:** the $K$ eligible names with the largest disclosed AIQ weights in the latest public snapshot, held with equal weight $1/K$.
+4. **topk_dw:** the same $K$ names as `topk_ew`, with weights proportional to their disclosed AIQ weights and scaled to sum to one.
 
-The optimized portfolio may hold fewer than $K$ names. The Top-$K$ baseline holds exactly $K$ when that is feasible. A disclosure-weighted Top-$K$ variant (same names, weights proportional to disclosed AIQ weights) is a planned extension and is not in `eval.py`.
+The optimized portfolio may hold fewer than $K$ names. Both Top-$K$ baselines hold exactly $K$ when that is feasible.
 
 ### Experiment grid (method)
 
-| Dimension                   | Method                                                                                                                             |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Baseline $\alpha$           | One solve and one eval at $\alpha=0.10$                                                                                            |
-| Selection-ratio sensitivity | Separate solve runs for $\alpha\in\{0.10,0.20,0.30,0.40,0.50\}$, each followed by its own eval; compare window metrics across runs |
-| Estimation window           | Same eligible universe; $L\in\{3,6,12\}$ months inside each solve when selected in `config.py`                                     |
-| Optional position caps      | $u\in\{1.00,0.50,0.25\}$ with $Ku\ge 1$; not required for the baseline path                                                        |
+| Dimension                   | Method                                                                                                                            |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Baseline $\alpha$           | `alphas=(0.10,)` in `config.py`, then eval with `EVAL_ALPHAS=(0.10,)` or `()`                                                     |
+| Selection-ratio sensitivity | `alphas=()` (or an explicit subset) so one solve folder stores every $\alpha$; `eval.py` selects `EVAL_ALPHAS` and compares paths |
+| Estimation window           | Same eligible universe; $L\in\{3,6,9,12\}$ months inside each solve when selected in `config.py`                                  |
+| Optional position caps      | $u\in\{1.00,0.50,0.25\}$ with $Ku\ge 1$; not required for the baseline path                                                       |
 
-`eval.py` always evaluates one solve directory. Cross-$\alpha$ comparison is a later aggregation over those eval folders, not a single mixed-$\alpha$ backtest.
+`eval.py` evaluates one solve directory. `EVAL_ALPHAS` chooses which stored ratios to backtest (`()` means every $\alpha$ in that solve). Metric tables include an `alpha` column. Each evaluated $\alpha$ gets its own path figure (`paths.png` when only one $\alpha$ is evaluated, otherwise `paths_aXX.png`). When two or more ratios are evaluated, `paths_best.png` overlays AIQ with the best **MIQP** path per $\alpha$ (lowest RMSE across estimation windows only; baselines are excluded), and `best_by_alpha.csv` records that choice.
 
 ## Data
 
@@ -187,32 +188,35 @@ python3.14 -m venv .venv
 .venv/bin/python eval.py
 ```
 
-`config.py` chooses the solver, the quarters, the windows, $\alpha$, and the solve time limit. An empty `quarters` tuple runs all twelve decision dates, from 2023Q4 through 2026Q3. `window_months` accepts only the prepared lengths 3, 6, and 12, and a single length is written `(3,)`. The two filters combine. No match raises `ValueError`.
+`config.py` chooses the solver, the quarters, the windows, the selection ratios, stopping rules, and `terminal_mode`. Stopping rules are the hard `time_limit_seconds`, the target `mip_gap`, and optional gap-stall early stopping (`gap_stall_seconds` / `gap_stall_min_drop`): if the relative MIP gap falls by less than the threshold over that window, the search stops with status `gap_stall`. Use `terminal_mode="summary"` for the post-solve summary tables with a quiet solver, or `terminal_mode="solver"` for the live solver log without those tables. Both modes keep a tqdm progress bar on the terminal; in solver mode the solver writes directly to stdout/stderr so its search log is not buffered away. An empty `quarters` tuple runs all twelve decision dates, from 2023Q4 through 2026Q3. `window_months` accepts only the prepared lengths 3, 6, 9, and 12, and a single length is written `(3,)`. `alphas` lists the selection ratios to solve: `(0.10,)` for one value, or `()` for every value in `ALL_ALPHAS` (`0.10` through `0.50`). One `main.py` run writes a single `output/solve/<run_id>/` folder; `summary.csv`, `checks.csv`, and `weights.csv` all carry an `alpha` column. The quarter and window filters combine. No match raises `ValueError`.
 
 `check.py` writes the audit tables under `output/check/`. `main.py` does not read that directory. It reloads the Excel extracts, builds the return matrices in memory, and solves them.
 
 Each solve creates `output/solve/<run_id>/`:
 
-| File          | Contents                                                                                            |
-| ------------- | --------------------------------------------------------------------------------------------------- |
-| `run.json`    | Python version, solver and version, windows, $\alpha$, $\ell$, $u$, time limit, and MIP-gap setting |
-| `summary.csv` | Status, training mean squared error, HHI, effective holdings, MIP gap, best bound, and runtime      |
-| `checks.csv`  | Budget, bounds, cardinality, and objective checks, each cell as `value (passed)`                    |
-| `weights.csv` | Every eligible name, in solve order, with weight and activation                                     |
+| File          | Contents                                                                                                 |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| `run.json`    | Python version, solver and version, windows, alphas, $\ell$, $u$, time limit, and MIP-gap setting        |
+| `summary.csv` | Per-alpha status, training mean squared error, HHI, effective holdings, MIP gap, best bound, and runtime |
+| `checks.csv`  | Per-alpha budget, bounds, cardinality, and objective checks, each cell as `value (passed)`               |
+| `weights.csv` | Per-alpha eligible names, in solve order, with weight and activation                                     |
 
-Rows are kept in calendar order, older quarters first. Within a quarter the shorter window comes first. `status` of `time_limit` or `iteration_limit` means the search stopped with a feasible incumbent.
+Rows are kept by alpha, then calendar order, older quarters first. Within a quarter the shorter window comes first. `status` of `time_limit`, `gap_limit`, `gap_stall`, or `iteration_limit` means the search stopped with a feasible incumbent (unless the model is infeasible).
 
-`eval.py` is configured at the top of the file: `SOLVE_RUN` selects `output/solve/<run_id>/` (empty string means the latest run with `weights.csv`). It writes `output/eval/<run_id>/`:
+`eval.py` is configured at the top of the file: `SOLVE_RUN` selects `output/solve/<run_id>/` (empty string means the latest run with `weights.csv`); `EVAL_ALPHAS` selects which stored selection ratios to evaluate. It writes `output/eval/<run_id>/`:
 
-| File                    | Contents                                                                       |
-| ----------------------- | ------------------------------------------------------------------------------ |
-| `eval.json`             | Solve path, $\alpha$, windows, formation quarters, and the execution rule used |
-| `daily_returns.csv`     | Daily portfolio, benchmark, and active returns by strategy and window          |
-| `quarterly_metrics.csv` | Per-quarter tracking, concentration, turnover, and holding overlap             |
-| `window_metrics.csv`    | Path-level aggregates used for the printed summary and figure labels           |
-| `baseline_weights.csv`  | Formation weights for `ew` and `topk`                                          |
-| `excluded_weights.csv`  | Eligible-universe exclusions and disclosed AIQ weight by reason                |
-| `paths.png`             | Cumulative-return paths for AIQ and each evaluated strategy                    |
+| File                          | Contents                                                                               |
+| ----------------------------- | -------------------------------------------------------------------------------------- |
+| `eval.json`                   | Solve path, evaluated alphas, windows, formation quarters, and the execution rule used |
+| `daily_returns.csv`           | Daily portfolio, benchmark, and active returns by alpha, strategy, and window          |
+| `quarterly_metrics.csv`       | Per-quarter tracking, concentration, turnover, and holding overlap                     |
+| `window_metrics.csv`          | Path-level aggregates used for the printed summary and figure labels                   |
+| `window_metrics_ranked.csv`   | When multiple alphas are evaluated: same rows ranked by lower RMSE                     |
+| `baseline_weights.csv`        | Formation weights for `ew`, `topk_ew`, and `topk_dw` by alpha                          |
+| `excluded_weights.csv`        | Eligible-universe exclusions and disclosed AIQ weight by reason                        |
+| `paths.png` / `paths_aXX.png` | Per-alpha cumulative-return paths (current figure format)                              |
+| `paths_best.png`              | When multiple alphas are evaluated: AIQ plus the best path per alpha                   |
+| `best_by_alpha.csv`           | Rows chosen for `paths_best.png`                                                       |
 
 ## Solvers
 
@@ -241,7 +245,7 @@ SPOT/
 
 ## Decisions still open
 
-Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, baseline $\alpha=0.10$, $\ell=0$, $u=1$, quarterly rebalancing, the 3/6/12-month windows on one eligible universe, exclusion of transaction costs from the base model, the out-of-sample buy-and-hold rule in `eval.py`, and the information-matched `ew` and `topk` baselines. The master table also fixes USD-only membership with no FX conversion, SEC filing dates as the publication time, no price forward fill, and eligibility that requires a return on every AIQ trading day in the prior twelve months.
+Fixed already: the project name, the AIQ benchmark, long-only fully invested tracking mean squared error, baseline $\alpha=0.10$, $\ell=0$, $u=1$, quarterly rebalancing, the 3/6/9/12-month windows on one eligible universe, exclusion of transaction costs from the base model, the out-of-sample buy-and-hold rule in `eval.py`, and the information-matched `ew`, `topk_ew`, and `topk_dw` baselines. The master table also fixes USD-only membership with no FX conversion, SEC filing dates as the publication time, no price forward fill, and eligibility that requires a return on every AIQ trading day in the prior twelve months.
 
 Still able to change whether the conclusions are valid:
 
@@ -249,6 +253,6 @@ Still able to change whether the conclusions are valid:
 2. A check of each SEC-derived filing date against the original EDGAR filing.
 3. Delisting proceeds in the backtest. The master table stops a series at its last price and does not create cash.
 4. The solve time limit used for reported runs, and which quarters are held out if earlier tests are used for tuning.
-5. How the $\alpha$ grid is orchestrated (manual repeated solves versus a batch driver) and which estimation window is treated as the headline comparison.
+5. Which estimation window is treated as the headline comparison when summarizing across $\alpha$, beyond the automatic min-RMSE pick used in `paths_best.png`.
 
-Not implemented yet: the disclosure-weighted Top-$K$ baseline, automated multi-$\alpha$ batch solves, and optional position-cap experiments.
+Not implemented yet: optional position-cap experiments.

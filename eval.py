@@ -8,7 +8,12 @@ from __future__ import annotations
 # Folder name under output/solve/, or a path to that folder.
 # Empty string selects the latest run that contains weights.csv.
 # Every window_months value present in that run's weights.csv is evaluated.
-SOLVE_RUN = "261017_200559"
+SOLVE_RUN = "261017_214151"
+
+# Selection ratios to evaluate from the solve run.
+# () uses every alpha present in weights.csv (or the run snapshot).
+# (0.10,) evaluates one ratio; (0.10, 0.30) evaluates a subset.
+EVAL_ALPHAS: tuple[float, ...] = ()
 
 # Drop the final decision date as a formation date. Its decision day is still
 # used as the end of the previous holding period.
@@ -26,7 +31,6 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from config import CONFIG
 from load import load_source_tables
 from preprocess import preprocess_master_frame
 from quarters import summarize_quarters
@@ -37,15 +41,16 @@ EVAL_ROOT = PROJECT_ROOT / "output" / "eval"
 
 STRATEGY_MIQP = "miqp"
 STRATEGY_EW = "ew"
-STRATEGY_TOPK = "topk"
-BASELINE_STRATEGIES = (STRATEGY_EW, STRATEGY_TOPK)
-STRATEGY_ORDER = (STRATEGY_MIQP, STRATEGY_EW, STRATEGY_TOPK)
+STRATEGY_TOPK_EW = "topk_ew"
+STRATEGY_TOPK_DW = "topk_dw"
+BASELINE_STRATEGIES = (STRATEGY_EW, STRATEGY_TOPK_EW, STRATEGY_TOPK_DW)
+STRATEGY_ORDER = (STRATEGY_MIQP, STRATEGY_EW, STRATEGY_TOPK_EW, STRATEGY_TOPK_DW)
 
 
 def main() -> None:
     solve_dir = _resolve_solve_dir(SOLVE_RUN)
-    weights = _load_weights(solve_dir / "weights.csv")
-    alpha = _solve_alpha(solve_dir)
+    weights = _load_weights(solve_dir / "weights.csv", solve_dir)
+    alphas = _eval_alphas(weights, solve_dir)
     tables = load_source_tables()
     master = preprocess_master_frame(tables)
     report = summarize_quarters(tables, master)
@@ -64,9 +69,10 @@ def main() -> None:
         "solve_dir": str(solve_dir.relative_to(PROJECT_ROOT)),
         "eval_dir": str(eval_dir.relative_to(PROJECT_ROOT)),
         "window_months": windows,
-        "alpha": alpha,
+        "alphas": alphas,
         "exclude_final_quarter": EXCLUDE_FINAL_QUARTER,
         "strategies": [STRATEGY_MIQP, *BASELINE_STRATEGIES],
+        "best_path_rule": "Within each alpha, choose the MIQP window with the lowest RMSE.",
         "execution": (
             "Weights are known before the decision-date open; "
             "the holding period is [decision_q, decision_{q+1})."
@@ -74,46 +80,62 @@ def main() -> None:
         "formation_quarters": formation["quarter"].tolist(),
     }
     (eval_dir / "eval.json").write_text(json.dumps(snapshot, indent=2) + "\n")
-
-    baselines = {
-        row.quarter: _baseline_weights(master, report, row.decision_date, row.quarter, alpha)
-        for row in formation.itertuples(index=False)
-    }
-    _write_baseline_weights(baselines, eval_dir / "baseline_weights.csv")
     _write_excluded_weights(report["parameters"], decisions["quarter"].tolist(), eval_dir / "excluded_weights.csv")
-
-    jobs: list[tuple[object, str, int | None, pd.Series]] = []
-    for row in formation.itertuples(index=False):
-        for months in windows:
-            block = weights.loc[
-                weights["quarter"].eq(row.quarter) & weights["window_months"].eq(months)
-            ]
-            if block.empty:
-                continue
-            jobs.append((row, STRATEGY_MIQP, months, _formation_weights(weights, row.quarter, months)))
-        for strategy in BASELINE_STRATEGIES:
-            jobs.append((row, strategy, None, baselines[row.quarter][strategy]))
 
     daily_rows: list[pd.DataFrame] = []
     quarterly_rows: list[dict[str, object]] = []
-    targets: dict[tuple[str, int | None, str], pd.Series] = {}
-    end_weights: dict[tuple[str, int | None, str], pd.Series] = {}
+    baseline_rows: list[dict[str, object]] = []
+    targets: dict[tuple[float, str, int | None, str], pd.Series] = {}
+    end_weights: dict[tuple[float, str, int | None, str], pd.Series] = {}
+
+    jobs: list[tuple[float, object, str, int | None, pd.Series]] = []
+    for alpha in alphas:
+        alpha_weights = weights.loc[weights["alpha"].eq(alpha)]
+        baselines = {
+            row.quarter: _baseline_weights(master, report, row.decision_date, row.quarter, alpha)
+            for row in formation.itertuples(index=False)
+        }
+        baseline_rows.extend(_baseline_weight_rows(baselines, alpha))
+        for row in formation.itertuples(index=False):
+            for months in windows:
+                block = alpha_weights.loc[
+                    alpha_weights["quarter"].eq(row.quarter) & alpha_weights["window_months"].eq(months)
+                ]
+                if block.empty:
+                    continue
+                jobs.append(
+                    (
+                        alpha,
+                        row,
+                        STRATEGY_MIQP,
+                        months,
+                        _formation_weights(alpha_weights, row.quarter, months),
+                    )
+                )
+            for strategy in BASELINE_STRATEGIES:
+                jobs.append((alpha, row, strategy, None, baselines[row.quarter][strategy]))
+
     with tqdm(total=len(jobs), position=0, leave=False, unit="") as progress:
-        for row, strategy, months, target in jobs:
+        for alpha, row, strategy, months, target in jobs:
             nxt = _next_quarter(row.quarter, decisions)
             end = decisions.loc[decisions["quarter"].eq(nxt), "decision_date"].iloc[0]
             hold_dates = calendar[(calendar >= row.decision_date) & (calendar < end)]
             if len(hold_dates) == 0:
-                raise ValueError(f"Empty holding period for {row.quarter} {strategy}.")
+                raise ValueError(
+                    f"Empty holding period for a{_alpha_tag(alpha)} {row.quarter} {strategy}."
+                )
             daily, drifted = _buy_and_hold(target, returns, benchmark, hold_dates)
             daily.insert(0, "window_months", months)
             daily.insert(0, "strategy", strategy)
             daily.insert(0, "quarter", row.quarter)
+            daily.insert(0, "alpha", alpha)
             daily_rows.append(daily)
-            key = (strategy, months, row.quarter)
+            key = (alpha, strategy, months, row.quarter)
             targets[key] = target
             end_weights[key] = drifted
-            quarterly_rows.append(_quarter_metrics(row.quarter, strategy, months, target, daily))
+            metrics = _quarter_metrics(row.quarter, strategy, months, target, daily)
+            metrics["alpha"] = alpha
+            quarterly_rows.append(metrics)
             progress.update(1)
 
     daily = pd.concat(daily_rows, ignore_index=True)
@@ -121,13 +143,26 @@ def main() -> None:
     quarterly = _sort_strategy_frame(pd.DataFrame(quarterly_rows))
     quarterly = _attach_stability_metrics(quarterly, targets, end_weights, formation["quarter"].tolist())
     path_summary = _sort_strategy_frame(_path_metrics(daily, quarterly))
-
+    pd.DataFrame(baseline_rows).to_csv(eval_dir / "baseline_weights.csv", index=False)
     daily.to_csv(eval_dir / "daily_returns.csv", index=False)
     quarterly.to_csv(eval_dir / "quarterly_metrics.csv", index=False)
     path_summary.to_csv(eval_dir / "window_metrics.csv", index=False)
-    _write_path_figure(daily, path_summary, decisions, eval_dir / "paths.png")
 
-    tqdm.write(path_summary.to_string(index=False))
+    for alpha in alphas:
+        alpha_daily = daily.loc[daily["alpha"].eq(alpha)].copy()
+        alpha_summary = path_summary.loc[path_summary["alpha"].eq(alpha)].copy()
+        figure_name = "paths.png" if len(alphas) == 1 else f"paths_a{_alpha_tag(alpha)}.png"
+        _write_path_figure(alpha_daily, alpha_summary, decisions, eval_dir / figure_name)
+
+    if len(alphas) > 1:
+        ranked = _rank_window_metrics(path_summary)
+        ranked.to_csv(eval_dir / "window_metrics_ranked.csv", index=False)
+        best = _best_paths_by_alpha(path_summary)
+        best.to_csv(eval_dir / "best_by_alpha.csv", index=False)
+        _write_best_alpha_figure(daily, best, decisions, eval_dir / "paths_best.png")
+        tqdm.write(ranked.to_string(index=False))
+    else:
+        tqdm.write(path_summary.to_string(index=False))
 
 
 def _resolve_solve_dir(solve_run: str) -> Path:
@@ -152,16 +187,7 @@ def _resolve_solve_dir(solve_run: str) -> Path:
     return candidates[0].parent.resolve()
 
 
-def _solve_alpha(solve_dir: Path) -> float:
-    summary_path = solve_dir / "summary.csv"
-    if summary_path.is_file():
-        summary = pd.read_csv(summary_path)
-        if "alpha" in summary.columns and not summary.empty:
-            return float(summary["alpha"].iloc[0])
-    return float(CONFIG.alpha)
-
-
-def _load_weights(path: Path) -> pd.DataFrame:
+def _load_weights(path: Path, solve_dir: Path) -> pd.DataFrame:
     frame = pd.read_csv(path)
     required = {"quarter", "window_months", "security_id", "weight"}
     missing = required - set(frame.columns)
@@ -172,7 +198,51 @@ def _load_weights(path: Path) -> pd.DataFrame:
     frame["weight"] = pd.to_numeric(frame["weight"], errors="coerce")
     if frame["weight"].isna().any():
         raise ValueError("weights.csv contains non-numeric weights.")
+    if "alpha" not in frame.columns:
+        frame["alpha"] = _fallback_alpha(solve_dir)
+    frame["alpha"] = pd.to_numeric(frame["alpha"], errors="coerce")
+    if frame["alpha"].isna().any():
+        raise ValueError("weights.csv contains non-numeric alpha values.")
     return frame
+
+
+def _fallback_alpha(solve_dir: Path) -> float:
+    summary_path = solve_dir / "summary.csv"
+    if summary_path.is_file():
+        summary = pd.read_csv(summary_path)
+        if "alpha" in summary.columns and not summary.empty:
+            return float(summary["alpha"].iloc[0])
+    run_path = solve_dir / "run.json"
+    if run_path.is_file():
+        payload = json.loads(run_path.read_text())
+        if "alphas" in payload and payload["alphas"]:
+            return float(payload["alphas"][0])
+        if "alpha" in payload:
+            return float(payload["alpha"])
+    raise ValueError(f"Could not infer alpha for {solve_dir}")
+
+
+def _solve_alphas(weights: pd.DataFrame, solve_dir: Path) -> list[float]:
+    values = sorted({float(value) for value in weights["alpha"].unique()})
+    if values:
+        return values
+    run_path = solve_dir / "run.json"
+    if run_path.is_file():
+        payload = json.loads(run_path.read_text())
+        if "alphas" in payload and payload["alphas"]:
+            return [float(value) for value in payload["alphas"]]
+    return [_fallback_alpha(solve_dir)]
+
+
+def _eval_alphas(weights: pd.DataFrame, solve_dir: Path) -> list[float]:
+    available = _solve_alphas(weights, solve_dir)
+    if not EVAL_ALPHAS:
+        return available
+    wanted = [float(value) for value in EVAL_ALPHAS]
+    missing = [value for value in wanted if not any(math.isclose(value, have, abs_tol=1e-12) for have in available)]
+    if missing:
+        raise ValueError(f"EVAL_ALPHAS not present in solve run: {missing}; available={available}")
+    return wanted
 
 
 def _decision_table(holdings: pd.DataFrame) -> pd.DataFrame:
@@ -249,21 +319,24 @@ def _baseline_weights(
     top = disclosed.sort_values(ascending=False).head(cardinality)
     if float(top.sum()) <= 0:
         raise ValueError(f"Top-K disclosed weights are all zero for {quarter}.")
-    topk = pd.Series(1.0 / cardinality, index=top.index, dtype="float64")
+    topk_ew = pd.Series(1.0 / cardinality, index=top.index, dtype="float64")
+    topk_dw = (top / top.sum()).astype("float64")
     universe = pd.Series(1.0 / len(eligible), index=eligible, dtype="float64")
     return {
         STRATEGY_EW: universe,
-        STRATEGY_TOPK: topk,
+        STRATEGY_TOPK_EW: topk_ew,
+        STRATEGY_TOPK_DW: topk_dw,
     }
 
 
-def _write_baseline_weights(baselines: dict[str, dict[str, pd.Series]], path: Path) -> None:
+def _baseline_weight_rows(baselines: dict[str, dict[str, pd.Series]], alpha: float) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for quarter, strategies in baselines.items():
         for strategy, weights in strategies.items():
             for position, (security_id, weight) in enumerate(weights.items(), start=1):
                 rows.append(
                     {
+                        "alpha": alpha,
                         "quarter": quarter,
                         "strategy": strategy,
                         "position": position,
@@ -271,7 +344,7 @@ def _write_baseline_weights(baselines: dict[str, dict[str, pd.Series]], path: Pa
                         "weight": float(weight),
                     }
                 )
-    pd.DataFrame(rows).to_csv(path, index=False)
+    return rows
 
 
 def _write_excluded_weights(parameters: pd.DataFrame, quarters: list[str], path: Path) -> None:
@@ -370,8 +443,8 @@ def _quarter_metrics(
 
 def _attach_stability_metrics(
     quarterly: pd.DataFrame,
-    targets: dict[tuple[str, int | None, str], pd.Series],
-    end_weights: dict[tuple[str, int | None, str], pd.Series],
+    targets: dict[tuple[float, str, int | None, str], pd.Series],
+    end_weights: dict[tuple[float, str, int | None, str], pd.Series],
     formation_quarters: list[str],
 ) -> pd.DataFrame:
     frame = quarterly.copy()
@@ -380,13 +453,14 @@ def _attach_stability_metrics(
     overlaps: list[float] = []
     for row in frame.itertuples(index=False):
         months = None if pd.isna(row.window_months) else int(row.window_months)
+        alpha = float(row.alpha)
         prior = previous.get(str(row.quarter))
         if prior is None:
             turnovers.append(float("nan"))
             overlaps.append(float("nan"))
             continue
-        prior_key = (str(row.strategy), months, prior)
-        current_key = (str(row.strategy), months, str(row.quarter))
+        prior_key = (alpha, str(row.strategy), months, prior)
+        current_key = (alpha, str(row.strategy), months, str(row.quarter))
         if prior_key not in end_weights or current_key not in targets:
             turnovers.append(float("nan"))
             overlaps.append(float("nan"))
@@ -417,7 +491,8 @@ def _holding_overlap(previous: pd.Series, current: pd.Series) -> float:
 def _add_paths(daily: pd.DataFrame) -> pd.DataFrame:
     frame = _sort_strategy_frame(daily)
     pieces: list[pd.DataFrame] = []
-    for (_, _), block in frame.groupby(["strategy", "window_months"], dropna=False, sort=False):
+    grouped = frame.groupby(["alpha", "strategy", "window_months"], dropna=False, sort=False)
+    for (_, _, _), block in grouped:
         block = block.copy()
         block["portfolio_cum"] = (1.0 + block["portfolio_return"]).cumprod()
         block["benchmark_cum"] = (1.0 + block["benchmark_return"].fillna(0.0)).cumprod()
@@ -429,18 +504,18 @@ def _add_paths(daily: pd.DataFrame) -> pd.DataFrame:
 def _path_metrics(daily: pd.DataFrame, quarterly: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     ordered = _sort_strategy_frame(daily)
-    grouped = ordered.groupby(["strategy", "window_months"], dropna=False, sort=False)
-    for (strategy, months), block in grouped:
+    grouped = ordered.groupby(["alpha", "strategy", "window_months"], dropna=False, sort=False)
+    for (alpha, strategy, months), block in grouped:
         active = block["active_return"].dropna()
         month_key = None if pd.isna(months) else int(months)
+        stability = quarterly.loc[quarterly["alpha"].eq(alpha) & quarterly["strategy"].eq(strategy)]
         if month_key is None:
-            stability = quarterly.loc[quarterly["strategy"].eq(strategy) & quarterly["window_months"].isna()]
+            stability = stability.loc[stability["window_months"].isna()]
         else:
-            stability = quarterly.loc[
-                quarterly["strategy"].eq(strategy) & quarterly["window_months"].eq(month_key)
-            ]
+            stability = stability.loc[stability["window_months"].eq(month_key)]
         rows.append(
             {
+                "alpha": float(alpha),
                 "strategy": strategy,
                 "window_months": month_key,
                 "n_quarters": int(block["quarter"].nunique()),
@@ -459,6 +534,30 @@ def _path_metrics(daily: pd.DataFrame, quarterly: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _rank_window_metrics(path_summary: pd.DataFrame) -> pd.DataFrame:
+    """Rank every alpha/strategy/window path by tracking quality.
+
+    Lower RMSE ranks first.
+    """
+    frame = path_summary.copy()
+    frame = frame.dropna(subset=["rmse"])
+    if frame.empty:
+        raise ValueError("No finite RMSE rows available to rank window metrics.")
+    frame = frame.sort_values("rmse", ascending=True, kind="mergesort").reset_index(drop=True)
+    frame.insert(0, "rank", range(1, len(frame) + 1))
+    return frame
+
+
+def _best_paths_by_alpha(path_summary: pd.DataFrame) -> pd.DataFrame:
+    frame = path_summary.loc[path_summary["strategy"].eq(STRATEGY_MIQP)].copy()
+    frame = frame.dropna(subset=["rmse"])
+    if frame.empty:
+        raise ValueError("No finite MIQP RMSE rows available to choose best paths.")
+    frame = frame.sort_values(["alpha", "rmse"], ascending=[True, True], kind="mergesort")
+    best = frame.groupby("alpha", sort=True, as_index=False).head(1).reset_index(drop=True)
+    return _sort_strategy_frame(best)
+
+
 def _return_corr(portfolio: pd.Series, benchmark: pd.Series) -> float:
     paired = pd.DataFrame({"portfolio": portfolio, "benchmark": benchmark}).dropna()
     if len(paired) < 2:
@@ -472,7 +571,10 @@ def _sort_strategy_frame(frame: pd.DataFrame) -> pd.DataFrame:
     order = {name: index for index, name in enumerate(STRATEGY_ORDER)}
     out = frame.copy()
     out["_strategy_order"] = out["strategy"].map(order).fillna(len(STRATEGY_ORDER))
-    sort_columns = ["_strategy_order"]
+    sort_columns = []
+    if "alpha" in out.columns:
+        sort_columns.append("alpha")
+    sort_columns.append("_strategy_order")
     if "window_months" in out.columns:
         sort_columns.append("window_months")
     if "quarter" in out.columns:
@@ -500,6 +602,10 @@ def _eval_dir_for_solve(solve_dir: Path) -> Path:
     return eval_dir
 
 
+def _alpha_tag(alpha: float) -> str:
+    return f"{int(round(float(alpha) * 100)):02d}"
+
+
 def _write_path_figure(
     daily: pd.DataFrame,
     path_summary: pd.DataFrame,
@@ -508,10 +614,17 @@ def _write_path_figure(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    miqp_colors = {3: "#ff7f0e", 6: "#2ca02c", 12: "#9467bd"}
+    miqp_colors = {3: "#ff7f0e", 6: "#2ca02c", 9: "#17becf", 12: "#9467bd"}
     baseline_colors = {
         STRATEGY_EW: "#d62728",
-        STRATEGY_TOPK: "#1f77b4",
+        STRATEGY_TOPK_EW: "#1f77b4",
+        STRATEGY_TOPK_DW: "#9ecae1",
+    }
+    # Layering: AIQ, then baselines (topk_dw under topk_ew), then MIQP on top.
+    baseline_zorder = {
+        STRATEGY_TOPK_DW: 2,
+        STRATEGY_TOPK_EW: 3,
+        STRATEGY_EW: 3,
     }
     metrics = _sort_strategy_frame(path_summary).copy()
     metrics["_months_key"] = metrics["window_months"].apply(
@@ -526,7 +639,6 @@ def _write_path_figure(
     )
     aiq["date"] = pd.to_datetime(aiq["date"])
     aiq["benchmark_cum"] = (1.0 + aiq["benchmark_return"].fillna(0.0)).cumprod()
-    axis.plot(aiq["date"], aiq["benchmark_cum"], color="#8a8a8a", linewidth=1.8, label="AIQ")
 
     x_min = aiq["date"].min()
     x_max = aiq["date"].max()
@@ -535,9 +647,21 @@ def _write_path_figure(
         if x_min <= stamp <= x_max:
             axis.axvline(stamp, color="#d0d0d0", linewidth=0.8, zorder=0)
 
+    axis.plot(
+        aiq["date"],
+        aiq["benchmark_cum"],
+        color="#000000",
+        linewidth=1.0,
+        label="AIQ",
+        zorder=1,
+    )
+
     ordered = _sort_strategy_frame(daily)
     plot_keys = list(ordered.groupby(["strategy", "window_months"], dropna=False, sort=False).groups)
-    for strategy, months in plot_keys:
+    baseline_keys = [(strategy, months) for strategy, months in plot_keys if strategy != STRATEGY_MIQP]
+    miqp_keys = [(strategy, months) for strategy, months in plot_keys if strategy == STRATEGY_MIQP]
+
+    def _plot_strategy(strategy: object, months: object, color: str, zorder: int) -> None:
         block = ordered.loc[
             (ordered["strategy"] == strategy)
             & (
@@ -558,16 +682,119 @@ def _write_path_figure(
             )
         ].iloc[0]
         label = (
-            f"{_strategy_label(strategy, month_key)}  "
+            f"{_strategy_label(str(strategy), month_key)}  "
             f"RMSE={_format_metric(float(row['rmse']))}  "
             f"corr={_format_metric(float(row['return_corr']))}"
         )
-        if strategy == STRATEGY_MIQP:
-            color = miqp_colors.get(month_key or 0, "#8c564b")
-        else:
-            color = baseline_colors.get(str(strategy), "#8c564b")
-        axis.plot(block["date"], block["portfolio_cum"], color=color, linewidth=1.8, label=label)
+        axis.plot(
+            block["date"],
+            block["portfolio_cum"],
+            color=color,
+            linewidth=1.0,
+            label=label,
+            zorder=zorder,
+        )
 
+    for strategy, months in baseline_keys:
+        _plot_strategy(
+            strategy,
+            months,
+            baseline_colors.get(str(strategy), "#8c564b"),
+            baseline_zorder.get(str(strategy), 3),
+        )
+    for strategy, months in miqp_keys:
+        month_key = None if pd.isna(months) else int(months)
+        _plot_strategy(
+            strategy,
+            months,
+            miqp_colors.get(month_key or 0, "#8c564b"),
+            4,
+        )
+
+    _style_path_axis(axis)
+    figure.tight_layout()
+    figure.savefig(path, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
+
+
+def _write_best_alpha_figure(
+    daily: pd.DataFrame,
+    best: pd.DataFrame,
+    decisions: pd.DataFrame,
+    path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+    figure, axis = plt.subplots(figsize=(10, 5.5), dpi=150)
+
+    aiq = (
+        daily.groupby("date", as_index=False)["benchmark_return"]
+        .first()
+        .sort_values("date", kind="mergesort")
+    )
+    aiq["date"] = pd.to_datetime(aiq["date"])
+    aiq["benchmark_cum"] = (1.0 + aiq["benchmark_return"].fillna(0.0)).cumprod()
+
+    x_min = aiq["date"].min()
+    x_max = aiq["date"].max()
+    for decision in decisions["decision_date"]:
+        stamp = pd.Timestamp(decision)
+        if x_min <= stamp <= x_max:
+            axis.axvline(stamp, color="#d0d0d0", linewidth=0.8, zorder=0)
+
+    axis.plot(
+        aiq["date"],
+        aiq["benchmark_cum"],
+        color="#000000",
+        linewidth=1.0,
+        label="AIQ",
+        zorder=1,
+    )
+
+    rows = best.reset_index(drop=True)
+    baseline_rows = rows.loc[rows["strategy"] != STRATEGY_MIQP]
+    miqp_rows = rows.loc[rows["strategy"] == STRATEGY_MIQP]
+    plot_rows = pd.concat([baseline_rows, miqp_rows], ignore_index=True)
+
+    for index, row in plot_rows.iterrows():
+        alpha = float(row["alpha"])
+        strategy = str(row["strategy"])
+        months = row["window_months"]
+        month_key = None if pd.isna(months) else int(months)
+        block = daily.loc[
+            daily["alpha"].eq(alpha)
+            & daily["strategy"].eq(strategy)
+            & (
+                daily["window_months"].isna()
+                if month_key is None
+                else daily["window_months"].eq(month_key)
+            )
+        ].sort_values("date", kind="mergesort")
+        block = block.copy()
+        block["date"] = pd.to_datetime(block["date"])
+        label = (
+            f"a{_alpha_tag(alpha)} {_strategy_label(strategy, month_key)}  "
+            f"RMSE={_format_metric(float(row['rmse']))}  "
+            f"corr={_format_metric(float(row['return_corr']))}"
+        )
+        zorder = 4 if strategy == STRATEGY_MIQP else 3
+        axis.plot(
+            block["date"],
+            block["portfolio_cum"],
+            color=colors[int(index) % len(colors)],
+            linewidth=1.0,
+            label=label,
+            zorder=zorder,
+        )
+
+    _style_path_axis(axis)
+    figure.tight_layout()
+    figure.savefig(path, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
+
+
+def _style_path_axis(axis) -> None:
     axis.set_title("")
     axis.set_xlabel("")
     axis.set_ylabel("")
@@ -578,9 +805,6 @@ def _write_path_figure(
     legend = axis.legend(frameon=False, loc="upper left")
     for text in legend.get_texts():
         text.set_fontsize(8)
-    figure.tight_layout()
-    figure.savefig(path, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
 
 
 def _strategy_label(strategy: str, months: int | None) -> str:
@@ -588,8 +812,10 @@ def _strategy_label(strategy: str, months: int | None) -> str:
         return f"L{months}"
     if strategy == STRATEGY_EW:
         return "ew"
-    if strategy == STRATEGY_TOPK:
-        return "topk"
+    if strategy == STRATEGY_TOPK_EW:
+        return "topk_ew"
+    if strategy == STRATEGY_TOPK_DW:
+        return "topk_dw"
     return strategy
 
 

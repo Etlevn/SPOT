@@ -6,16 +6,18 @@ import json
 import platform
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator, TextIO
 
 import pandas as pd
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from config import CONFIG
+from config import CONFIG, selected_alphas, selected_terminal_mode
 from load import load_source_tables
 from preprocess import preprocess_master_frame
 from quarters import summarize_quarters
@@ -25,6 +27,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "solve"
 
 
 def main() -> None:
+    terminal_mode = selected_terminal_mode()
     tables = load_source_tables()
     master = preprocess_master_frame(tables)
     report = summarize_quarters(tables, master)
@@ -32,39 +35,88 @@ def main() -> None:
         _selected_panels(report["panels"]),
         key=lambda panel: (str(panel["quarter"]), int(panel["months"])),
     )
+    alphas = selected_alphas()
     run_id, run_dir = _allocate_run_dir()
-    snapshot = _run_snapshot()
+    snapshot = _run_snapshot(alphas, terminal_mode)
     _write_snapshot(run_dir / "run.json", snapshot)
-    tqdm.write(run_id)
-    with tqdm(total=len(panels), position=0, leave=False, unit="") as progress:
-        for panel in panels:
-            solution = solve_miqp(
-                panel,
-                alpha=CONFIG.alpha,
-                ell=CONFIG.ell,
-                u=CONFIG.u,
-                feasibility_tolerance=CONFIG.feasibility_tolerance,
-                time_limit_seconds=CONFIG.time_limit_seconds,
-                mip_gap=CONFIG.mip_gap,
-                solver_log=CONFIG.solver_log,
-                solver=CONFIG.solver,
-            )
-            if " " not in str(snapshot["solver"]):
-                snapshot["solver"] = f"{solution.solver} {solution.solver_version}"
-                _write_snapshot(run_dir / "run.json", snapshot)
-            _print_solution(solution)
-            _append_solution(solution, run_id, run_dir)
-            progress.update(1)
+    jobs = len(alphas) * len(panels)
+    with _terminal_display(jobs) as (progress, console):
+        _console_write(run_id, console)
+        for alpha in alphas:
+            for panel in panels:
+                label = _job_label(alpha, str(panel["quarter"]), int(panel["months"]))
+                if terminal_mode == "solver":
+                    _console_write(f"{'=' * 30} {label} {'=' * 30}", console)
+                    progress.refresh()
+                # Leave stdout/stderr alone so SCIP/Gurobi can stream their logs.
+                solution = solve_miqp(
+                    panel,
+                    alpha=alpha,
+                    ell=CONFIG.ell,
+                    u=CONFIG.u,
+                    feasibility_tolerance=CONFIG.feasibility_tolerance,
+                    time_limit_seconds=CONFIG.time_limit_seconds,
+                    mip_gap=CONFIG.mip_gap,
+                    gap_stall_seconds=CONFIG.gap_stall_seconds,
+                    gap_stall_min_drop=CONFIG.gap_stall_min_drop,
+                    solver_log=terminal_mode == "solver",
+                    solver=CONFIG.solver,
+                )
+                if " " not in str(snapshot["solver"]):
+                    snapshot["solver"] = f"{solution.solver} {solution.solver_version}"
+                    _write_snapshot(run_dir / "run.json", snapshot)
+                if terminal_mode == "summary":
+                    _print_solution(solution, alpha, console)
+                _append_solution(solution, run_id, run_dir, alpha)
+                progress.update(1)
+                progress.refresh()
 
 
-def _print_solution(solution: Solution) -> None:
-    label = f"{solution.quarter[:4]}_{solution.quarter[4:]}_L{solution.window_months}"
+def _job_label(alpha: float, quarter: str, months: int) -> str:
+    return f"a{_alpha_tag(alpha)} {quarter[:4]}_{quarter[4:]}_L{months}"
+
+
+@contextmanager
+def _terminal_display(jobs: int) -> Iterator[tuple[tqdm, TextIO]]:
+    """Draw the progress bar on the real terminal, below scrolling solver logs."""
+    console = _open_console_stream()
+    owns_console = console is not sys.stderr and console is not sys.stdout
+    try:
+        with tqdm(
+            total=jobs,
+            position=0,
+            leave=True,
+            unit="",
+            file=console,
+            dynamic_ncols=True,
+            mininterval=0.1,
+        ) as progress:
+            yield progress, console
+    finally:
+        if owns_console:
+            console.close()
+
+
+def _open_console_stream() -> TextIO:
+    try:
+        return open("/dev/tty", "w", encoding="utf-8", buffering=1)
+    except OSError:
+        return sys.stderr
+
+
+def _console_write(text: str, console: TextIO) -> None:
+    tqdm.write(text, file=console)
+
+
+def _print_solution(solution: Solution, alpha: float, console: TextIO) -> None:
+    label = _job_label(alpha, solution.quarter, solution.window_months)
     hhi, effective_holdings = _concentration(solution.weights)
     solve = pd.DataFrame(
         [
             {
                 "solver": solution.solver,
                 "solver_version": solution.solver_version,
+                "alpha": alpha,
                 "quarter": solution.quarter,
                 "window_months": solution.window_months,
                 "status": solution.status,
@@ -86,20 +138,20 @@ def _print_solution(solution: Solution) -> None:
     holdings = holdings.sort_values("weight", ascending=False)
     holdings["weight"] = holdings["weight"].map(_format_float)
     holdings["activated"] = holdings["activated"].map(_format_float)
-    tqdm.write(f"{'=' * 30} {label} {'=' * 30}")
-    tqdm.write("")
-    tqdm.write("Solve")
-    tqdm.write(solve.to_string(index=False))
-    tqdm.write("")
-    tqdm.write("Constraint checks")
-    tqdm.write(checks.to_string(index=False))
-    tqdm.write("")
-    tqdm.write("Selected holdings")
+    _console_write(f"{'=' * 30} {label} {'=' * 30}", console)
+    _console_write("", console)
+    _console_write("Solve", console)
+    _console_write(solve.to_string(index=False), console)
+    _console_write("", console)
+    _console_write("Constraint checks", console)
+    _console_write(checks.to_string(index=False), console)
+    _console_write("", console)
+    _console_write("Selected holdings", console)
     if holdings.empty:
-        tqdm.write("No holdings in the solution.")
+        _console_write("No holdings in the solution.", console)
     else:
-        tqdm.write(holdings.T.to_string())
-    tqdm.write("")
+        _console_write(holdings.T.to_string(), console)
+    _console_write("", console)
 
 
 def _selected_panels(panels: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -128,7 +180,7 @@ def _allocate_run_dir() -> tuple[str, Path]:
         return run_id, run_dir
 
 
-def _run_snapshot() -> dict[str, object]:
+def _run_snapshot(alphas: tuple[float, ...], terminal_mode: str) -> dict[str, object]:
     config = asdict(CONFIG)
     windows = list(config["window_months"])
     quarters = list(config["quarters"])
@@ -136,11 +188,14 @@ def _run_snapshot() -> dict[str, object]:
         "python": platform.python_version(),
         "solver": config["solver"],
         "windows": windows,
-        "alpha": config["alpha"],
+        "alphas": list(alphas),
         "ell": config["ell"],
         "u": config["u"],
         "time_limit_seconds": config["time_limit_seconds"],
         "mip_gap": config["mip_gap"],
+        "gap_stall_seconds": config["gap_stall_seconds"],
+        "gap_stall_min_drop": config["gap_stall_min_drop"],
+        "terminal_mode": terminal_mode,
     }
     if quarters:
         snapshot["quarters"] = quarters
@@ -158,7 +213,7 @@ def _write_snapshot(path: Path, snapshot: dict[str, object]) -> None:
     path.write_text("\n".join(lines))
 
 
-def _append_solution(solution: Solution, run_id: str, run_dir: Path) -> None:
+def _append_solution(solution: Solution, run_id: str, run_dir: Path, alpha: float) -> None:
     quarter = solution.quarter
     months = solution.window_months
     hhi, effective_holdings = _concentration(solution.weights)
@@ -168,12 +223,12 @@ def _append_solution(solution: Solution, run_id: str, run_dir: Path) -> None:
                 "run_id": run_id,
                 "solver": solution.solver,
                 "solver_version": solution.solver_version,
+                "alpha": alpha,
                 "quarter": quarter,
                 "window_months": months,
                 "status": solution.status,
                 "N": solution.n,
                 "K": solution.k,
-                "alpha": CONFIG.alpha,
                 "ell": CONFIG.ell,
                 "u": CONFIG.u,
                 "mean_squared_error": solution.mean_squared_error,
@@ -189,6 +244,7 @@ def _append_solution(solution: Solution, run_id: str, run_dir: Path) -> None:
         [
             {
                 "run_id": run_id,
+                "alpha": alpha,
                 "quarter": quarter,
                 "window_months": months,
                 **_check_cells(solution.checks, formatted=False),
@@ -198,6 +254,7 @@ def _append_solution(solution: Solution, run_id: str, run_dir: Path) -> None:
     weights = pd.DataFrame(
         {
             "run_id": run_id,
+            "alpha": alpha,
             "quarter": quarter,
             "window_months": months,
             "position": range(1, len(solution.weights) + 1),
@@ -206,9 +263,10 @@ def _append_solution(solution: Solution, run_id: str, run_dir: Path) -> None:
             "activated": solution.activated.reindex(solution.weights.index).to_numpy(),
         }
     )
-    _write_sorted(summary, run_dir / "summary.csv", ["quarter", "window_months"])
-    _write_sorted(checks, run_dir / "checks.csv", ["quarter", "window_months"])
-    _write_sorted(weights, run_dir / "weights.csv", ["quarter", "window_months", "position"])
+    sort_keys = ["alpha", "quarter", "window_months"]
+    _write_sorted(summary, run_dir / "summary.csv", sort_keys)
+    _write_sorted(checks, run_dir / "checks.csv", sort_keys)
+    _write_sorted(weights, run_dir / "weights.csv", [*sort_keys, "position"])
 
 
 def _concentration(weights: pd.Series) -> tuple[float, float | None]:
@@ -235,6 +293,10 @@ def _write_sorted(frame: pd.DataFrame, path: Path, columns: list[str]) -> None:
         sort_columns.append("_field_order")
     frame = frame.sort_values(sort_columns, kind="mergesort").drop(columns="_field_order", errors="ignore")
     frame.to_csv(path, index=False)
+
+
+def _alpha_tag(alpha: float) -> str:
+    return f"{int(round(alpha * 100)):02d}"
 
 
 def _format_optional(value: float | None) -> str:
